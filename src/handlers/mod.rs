@@ -13,6 +13,10 @@ use axum::http::{HeaderMap, header};
 
 use crate::{body::upload::is_aws_chunked_request, error::S3Error, s3::types::ContentLength};
 
+/// Validates request body framing for operations that require upload bytes.
+///
+/// Plain uploads must provide `Content-Length`; aws-chunked uploads may combine
+/// `Transfer-Encoding: chunked` with aws-chunked content encoding.
 pub(crate) fn validate_supported_request_body_length(headers: &HeaderMap) -> Result<(), S3Error> {
     let content_length = validate_content_length(headers)?;
     let transfer_encoding = validate_transfer_encoding(headers)?;
@@ -33,6 +37,7 @@ pub(crate) fn validate_supported_request_body_length(headers: &HeaderMap) -> Res
     }
 }
 
+/// Validates that an operation expecting no body has no transfer encoding and no nonzero length.
 pub(crate) fn validate_empty_request_body_headers(
     headers: &HeaderMap,
     operation: &str,

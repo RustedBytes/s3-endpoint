@@ -39,6 +39,10 @@ pub(crate) struct FinalUploadBody {
     pub digests: ChecksumDigests,
 }
 
+/// Re-reads a staged upload and computes the final size and checksum digests.
+///
+/// This is used after upload processors may have replaced the originally
+/// uploaded bytes.
 pub(crate) async fn summarize_staged_upload(
     path: &Path,
     buffer_size: usize,
@@ -86,6 +90,11 @@ pub(crate) async fn summarize_staged_upload(
     })
 }
 
+/// Streams an HTTP request body to `writer` while validating S3 payload integrity.
+///
+/// Supports plain bodies and aws-chunked bodies, enforces decoded size limits,
+/// validates SigV4 streaming chunk signatures when present, and returns the
+/// decoded body size plus checksums to echo in the response.
 pub async fn write_upload_body<W>(
     headers: &HeaderMap,
     body: Body,
@@ -166,6 +175,7 @@ where
     })
 }
 
+/// Parses the `x-amz-content-sha256` payload mode from request headers.
 pub(crate) fn payload_hash_mode(headers: &HeaderMap) -> Result<PayloadHashMode, S3Error> {
     let value = optional_singleton_header(headers, "x-amz-content-sha256")?
         .map(|value| value.to_str())
@@ -199,6 +209,7 @@ fn validate_payload_hash_mode(headers: &HeaderMap) -> Result<(), S3Error> {
     }
 }
 
+/// Validates an actual SHA-256 payload hash for ordinary non-aws-chunked bodies.
 pub(crate) fn validate_actual_sha256_payload_hash(
     headers: &HeaderMap,
     actual_digest: &[u8],
@@ -223,6 +234,7 @@ pub(crate) fn validate_actual_sha256_payload_hash(
     }
 }
 
+/// Validates a fixed SHA-256 payload hash for operations with a known digest.
 pub(crate) fn validate_fixed_sha256_payload_hash(
     headers: &HeaderMap,
     actual_digest: &[u8],
@@ -736,6 +748,7 @@ fn subtle_constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     left.ct_eq(right).into()
 }
 
+/// Returns whether the request declares S3 `aws-chunked` content encoding.
 pub(crate) fn is_aws_chunked_request(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_ENCODING)

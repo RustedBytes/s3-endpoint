@@ -540,6 +540,7 @@ impl SecretKey {
         Ok(Self(value))
     }
 
+    /// Returns the raw secret key for signing verification.
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
@@ -842,29 +843,35 @@ impl AuthState {
         })
     }
 
+    /// Returns whether unsigned anonymous requests may be authenticated.
     pub(crate) fn allow_anonymous(&self) -> bool {
         self.allow_anonymous
     }
 
+    /// Returns the configured SigV4 region.
     pub(crate) fn region(&self) -> &str {
         &self.region
     }
 
+    /// Returns the maximum accepted SigV4 timestamp skew in seconds.
     pub(crate) fn max_skew_seconds(&self) -> i64 {
         self.max_skew_seconds
     }
 
+    /// Returns whether anonymous requests may access `bucket`.
     pub(crate) fn permits_anonymous_bucket(&self, bucket: &BucketName) -> bool {
         self.anonymous_allowed_buckets.is_empty()
             || self.anonymous_allowed_buckets.contains(bucket.as_str())
     }
 
+    /// Looks up an active or inactive configured access key by ID.
     pub(crate) fn credential(&self, access_key_id: &str) -> Option<ConfiguredAccessKey<'_>> {
         self.credentials
             .get(access_key_id)
             .map(StoredAccessKey::as_configured)
     }
 
+    /// Returns whether a configured credential may perform `action` on `bucket`.
     pub(crate) fn permits_credential(
         &self,
         access_key_id: &str,

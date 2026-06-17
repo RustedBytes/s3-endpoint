@@ -190,18 +190,24 @@ impl AppState {
         })
     }
 
+    /// Returns the registered upload processors in execution order.
     pub(crate) fn upload_processors(&self) -> &[SharedUploadProcessor] {
         &self.upload_processors
     }
 
+    /// Creates the next S3 request ID using the configured factory.
     pub(crate) fn request_id(&self) -> s3::types::RequestId {
         self.request_id_factory.request_id()
     }
 
+    /// Returns the current application time from the configured clock.
     pub(crate) fn now(&self) -> chrono::DateTime<chrono::Utc> {
         self.clock.now()
     }
 
+    /// Attempts custom authentication when an authentication provider is configured.
+    ///
+    /// Returns `None` when the built-in SigV4/anonymous authenticator should be used.
     pub(crate) async fn authenticate_with_provider(
         &self,
         request: AuthenticationRequest,
@@ -210,12 +216,14 @@ impl AppState {
         Some(provider.authenticate(request).await)
     }
 
+    /// Notifies the optional request observer without affecting request handling.
     pub(crate) async fn observe_request(&self, context: S3RequestContext) {
         if let Some(observer) = &self.request_observer {
             observer.observe(context).await;
         }
     }
 
+    /// Applies the optional error mapper before an S3 error is serialized.
     pub(crate) async fn map_error(
         &self,
         context: S3ErrorContext,
@@ -228,6 +236,7 @@ impl AppState {
         }
     }
 
+    /// Applies the optional response mapper to a completed S3 response.
     pub(crate) async fn map_response(
         &self,
         context: S3ResponseContext,
@@ -240,6 +249,7 @@ impl AppState {
         }
     }
 
+    /// Checks whether an operation is enabled and allowed by the operation policy.
     pub(crate) fn allow_operation(&self, context: OperationContext) -> Result<(), error::S3Error> {
         if self.disabled_operations.contains(&context.action) {
             return Err(error::S3Error::method_not_allowed());
@@ -251,6 +261,7 @@ impl AppState {
         }
     }
 
+    /// Checks whether a bucket/key target is allowed by the target policy.
     pub(crate) fn allow_target(&self, context: TargetContext) -> Result<(), error::S3Error> {
         if let Some(policy) = &self.target_policy {
             policy.allow_target(context)
@@ -259,6 +270,7 @@ impl AppState {
         }
     }
 
+    /// Checks whether an upload operation is allowed before body bytes are stored.
     pub(crate) fn allow_upload(&self, context: UploadPolicyContext) -> Result<(), error::S3Error> {
         if let Some(policy) = &self.upload_policy {
             policy.allow_upload(context)
@@ -267,6 +279,7 @@ impl AppState {
         }
     }
 
+    /// Begins a tenant-limited operation and returns its lease.
     pub(crate) async fn begin_tenant_operation(
         &self,
         context: TenantLimitContext,
@@ -274,6 +287,7 @@ impl AppState {
         self.tenant_limits_provider.begin_operation(context).await
     }
 
+    /// Reports a tenant-limited operation outcome to the configured provider.
     pub(crate) async fn finish_tenant_operation(
         &self,
         context: TenantLimitContext,
@@ -284,6 +298,7 @@ impl AppState {
             .await;
     }
 
+    /// Checks whether the authenticated principal may access the requested target.
     pub(crate) fn authorize_with_policy(
         &self,
         context: AuthorizationContext,
@@ -295,6 +310,7 @@ impl AppState {
         }
     }
 
+    /// Acquires one global S3 request admission permit.
     pub(crate) fn try_acquire_s3_request(&self) -> Result<OwnedSemaphorePermit, error::S3Error> {
         self.admission
             .s3_requests
@@ -305,6 +321,7 @@ impl AppState {
             })
     }
 
+    /// Acquires one single-object upload writer permit.
     pub(crate) fn try_acquire_object_writer(&self) -> Result<OwnedSemaphorePermit, error::S3Error> {
         self.admission
             .object_writers
@@ -315,6 +332,7 @@ impl AppState {
             })
     }
 
+    /// Acquires one multipart part writer permit.
     pub(crate) fn try_acquire_multipart_part_writer(
         &self,
     ) -> Result<OwnedSemaphorePermit, error::S3Error> {
@@ -329,6 +347,9 @@ impl AppState {
             })
     }
 
+    /// Acquires an aws-chunked decoder permit when the request uses aws-chunked encoding.
+    ///
+    /// Returns `Ok(None)` for ordinary non-aws-chunked request bodies.
     pub(crate) fn try_acquire_aws_chunked_decoder(
         &self,
         headers: &HeaderMap,

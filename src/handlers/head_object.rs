@@ -14,6 +14,7 @@ use crate::{
     storage::ObjectMetadata,
 };
 
+/// Handles `HeadObject`, returning metadata headers or conditional responses.
 pub(crate) async fn head_object(
     state: AppState,
     request: Request<Body>,
@@ -44,6 +45,11 @@ pub(crate) async fn head_object(
     metadata_response(metadata, request_id)
 }
 
+/// Evaluates HTTP conditional request headers against object metadata.
+///
+/// Returns a prebuilt `304 Not Modified` response when a cache validator
+/// matches, `Ok(None)` when the caller should continue, or an S3 precondition
+/// error when required conditions fail.
 pub(crate) fn conditional_response(
     headers: &HeaderMap,
     metadata: &ObjectMetadata,
@@ -147,6 +153,7 @@ fn parse_http_datetime(value: &str, header_name: &'static str) -> Result<DateTim
         .map_err(|_| S3Error::invalid_argument(format!("{header_name} must be an HTTP-date")))
 }
 
+/// Creates a standard object metadata response builder with status `200 OK`.
 pub(crate) fn object_metadata_response_builder(
     metadata: &ObjectMetadata,
     request_id: &RequestId,
@@ -159,6 +166,7 @@ pub(crate) fn object_metadata_response_builder(
     )
 }
 
+/// Creates an object metadata response builder for a custom status and body length.
 pub(crate) fn object_metadata_response_builder_with_status_and_length(
     metadata: &ObjectMetadata,
     request_id: &RequestId,

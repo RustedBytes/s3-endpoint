@@ -87,6 +87,7 @@ impl TenantId {
         &self.0
     }
 
+    /// Derives a validated tenant ID from the authenticated request principal.
     pub(crate) fn from_principal(principal: &RequestPrincipal) -> Result<Self, TenantIdError> {
         match principal {
             RequestPrincipal::Anonymous => Self::parse("anonymous"),
@@ -224,6 +225,7 @@ impl AuthenticationResult {
         &self.principal
     }
 
+    /// Splits the authentication result into the downstream principal and access key ID.
     pub(crate) fn into_parts(self) -> (RequestPrincipal, Option<AccessKeyId>) {
         (self.principal, self.access_key_id)
     }

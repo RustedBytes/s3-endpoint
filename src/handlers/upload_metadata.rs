@@ -7,6 +7,11 @@ use crate::{
     storage::{ChecksumAlgorithm, ChecksumType, UploadMetadata},
 };
 
+/// Collects persisted object metadata from upload request headers.
+///
+/// Duplicate metadata headers and non-ASCII values are rejected. The
+/// transport-only `aws-chunked` content encoding is stripped before metadata is
+/// stored.
 pub(crate) fn collect_upload_metadata(headers: &HeaderMap) -> Result<UploadMetadata, S3Error> {
     Ok(UploadMetadata {
         content_type: optional_header(headers, header::CONTENT_TYPE.as_str())?,

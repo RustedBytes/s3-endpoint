@@ -18,6 +18,7 @@ pub(super) struct MultipartCompleteChecksumState<'a> {
 }
 
 impl MultipartCompleteChecksumState<'static> {
+    /// Creates digest state only for checksums requested by the client.
     pub(super) fn new(checksum_request: &ChecksumRequest) -> Self {
         Self {
             md5: checksum_request.requires_md5().then(Md5::new),
@@ -31,6 +32,7 @@ impl MultipartCompleteChecksumState<'static> {
 }
 
 impl MultipartCompleteChecksumState<'_> {
+    /// Feeds completed multipart object bytes into every enabled digest.
     pub(super) fn update(&mut self, bytes: &[u8]) {
         if let Some(md5) = &mut self.md5 {
             md5.update(bytes);
@@ -52,6 +54,7 @@ impl MultipartCompleteChecksumState<'_> {
         }
     }
 
+    /// Finalizes enabled digests and returns default values for disabled algorithms.
     pub(super) fn finalize(self) -> ChecksumDigests {
         ChecksumDigests {
             md5: self
@@ -82,6 +85,7 @@ impl MultipartCompleteChecksumState<'_> {
     }
 
     #[cfg(test)]
+    /// Returns which digests are enabled for focused unit tests.
     pub(super) fn enabled_digests(&self) -> EnabledDigests {
         EnabledDigests {
             md5: self.md5.is_some(),

@@ -12,6 +12,7 @@ use crate::{
     s3::types::RequestId,
 };
 
+/// Handles `HeadBucket` by validating access to the resolved bucket.
 pub(crate) async fn head_bucket(
     state: AppState,
     request: Request<Body>,

@@ -21,6 +21,7 @@ use crate::{
     s3::types::RequestId,
 };
 
+/// Handles `GetObject`, including conditional requests, single ranges, and response overrides.
 pub(crate) async fn get_object(
     state: AppState,
     request: Request<Body>,

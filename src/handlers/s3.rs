@@ -22,6 +22,11 @@ use crate::{
     },
 };
 
+/// Handles one S3 HTTP request from routing through response mapping.
+///
+/// This function assigns the request ID, records observer/log context, applies
+/// global request admission, dispatches the detected operation, and strips HEAD
+/// response bodies before response mapping.
 pub async fn handle_s3_request(State(state): State<AppState>, request: Request<Body>) -> Response {
     let method = request.method().clone();
     let query = request.uri().query().unwrap_or_default().to_owned();
@@ -212,11 +217,13 @@ struct RequestLogContext {
 #[derive(Clone, Copy, Debug)]
 struct DecodedBodyBytes(u64);
 
+/// Records the decoded upload byte count on a response for logging and tenant-limit outcomes.
 pub(crate) fn record_decoded_body_bytes(mut response: Response, bytes: u64) -> Response {
     response.extensions_mut().insert(DecodedBodyBytes(bytes));
     response
 }
 
+/// Returns a stable SHA-256 hex digest for logging an object key without exposing it.
 pub(crate) fn object_key_sha256(key: &ObjectKey) -> String {
     hex::encode(Sha256::digest(key.as_str().as_bytes()))
 }
@@ -623,10 +630,15 @@ fn has_object_route(request: &Request<Body>, virtual_host_base_domain: Option<&s
     }
 }
 
+/// Returns the first decoded query value for `name`.
+///
+/// Invalid percent encoding is treated as absence. Use [`unique_query_param`]
+/// when duplicates or invalid encoding must be reported to the client.
 pub(crate) fn query_param(query: &str, name: &str) -> Option<String> {
     query_param_values(query, name).into_iter().next()
 }
 
+/// Returns one decoded query value for `name`, rejecting duplicates and invalid encoding.
 pub(crate) fn unique_query_param(query: &str, name: &str) -> Result<Option<String>, S3Error> {
     let mut values = query_param_values_checked(query, name)?;
     if values.len() > 1 {

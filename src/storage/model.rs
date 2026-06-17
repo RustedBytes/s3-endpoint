@@ -131,6 +131,7 @@ impl UploadSession {
         self.state == UploadState::Open
     }
 
+    /// Returns `NoSuchUpload` when the session is not open for mutation.
     pub(super) fn ensure_open(&self) -> Result<(), StoreError> {
         if self.is_open() {
             Ok(())

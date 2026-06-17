@@ -12,6 +12,7 @@ use crate::{
     s3::types::RequestId,
 };
 
+/// Handles `DeleteObject`, treating a missing object as a successful delete.
 pub(crate) async fn delete_object(
     state: AppState,
     request: Request<Body>,

@@ -30,6 +30,7 @@ use crate::{
 
 const COMPLETE_MULTIPART_XML_LIMIT: usize = 8 * 1024 * 1024;
 
+/// Handles `CreateMultipartUpload` by creating a persisted open upload session.
 pub(crate) async fn create_multipart_upload(
     state: AppState,
     request: Request<Body>,
@@ -87,6 +88,10 @@ pub(crate) async fn create_multipart_upload(
     xml_response(StatusCode::OK, request_id, body)
 }
 
+/// Handles `UploadPart`, streaming one part into temporary storage before commit.
+///
+/// The upload session, owner, target, body framing, checksums, and part size
+/// limit are validated before the part is published.
 pub(crate) async fn upload_part(
     state: AppState,
     request: Request<Body>,
@@ -193,6 +198,7 @@ pub(crate) async fn upload_part(
     ))
 }
 
+/// Handles `ListParts` with S3-compatible pagination bounds.
 pub(crate) async fn list_parts(
     state: AppState,
     request: Request<Body>,
@@ -289,6 +295,7 @@ fn checksum_xml_element_name(header_name: &str) -> Option<&'static str> {
     ChecksumName::from_header_name(header_name).map(ChecksumName::xml_element_name)
 }
 
+/// Handles `AbortMultipartUpload`, closing the session and removing part storage.
 pub(crate) async fn abort_multipart_upload(
     state: AppState,
     request: Request<Body>,
@@ -328,6 +335,10 @@ pub(crate) async fn abort_multipart_upload(
         .map_err(|err| S3Error::internal(format!("failed to build response: {err}")))
 }
 
+/// Handles `CompleteMultipartUpload`, validating the XML part list and committing the object.
+///
+/// The completion path verifies ordered parts, ETag matches, minimum non-final
+/// part sizes, final object size, and full-object checksums before publishing.
 pub(crate) async fn complete_multipart_upload(
     state: AppState,
     request: Request<Body>,

@@ -27,6 +27,10 @@ use crate::{
     storage::ObjectMetadata,
 };
 
+/// Handles `PutObject`, streaming the request body into temporary storage before commit.
+///
+/// The upload is authorized and policy-checked before body bytes are read.
+/// Temporary data is discarded on body, processor, checksum, or size failures.
 pub(crate) async fn handle_put_object(
     state: AppState,
     request: Request<Body>,
@@ -186,6 +190,7 @@ pub(crate) async fn handle_put_object(
     ))
 }
 
+/// Rejects upload headers for S3 features this endpoint does not implement.
 pub(crate) fn validate_upload_headers(headers: &HeaderMap) -> Result<(), S3Error> {
     const UNSUPPORTED_HEADERS: &[&str] = &[
         "x-amz-server-side-encryption",

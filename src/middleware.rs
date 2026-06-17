@@ -216,6 +216,10 @@ where
     }
 }
 
+/// Runs upload processors sequentially against staged object bytes.
+///
+/// Each processor may keep the current bytes or replace them with its reserved
+/// replacement file. On rejection or failure, staged bytes are discarded.
 pub(crate) async fn process_staged_upload(
     processors: &[SharedUploadProcessor],
     mut staged: StagedObject,
@@ -289,6 +293,7 @@ impl From<std::io::Error> for UploadProcessorError {
     }
 }
 
+/// Returns whether no upload processors are configured.
 pub(crate) fn processors_are_empty(processors: &[SharedUploadProcessor]) -> bool {
     processors.is_empty()
 }

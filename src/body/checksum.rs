@@ -31,6 +31,7 @@ pub(crate) enum ChecksumName {
 }
 
 impl ChecksumName {
+    /// Returns the S3 response/request header for this checksum algorithm.
     pub(crate) fn header_name(self) -> &'static str {
         match self {
             Self::Crc32 => "x-amz-checksum-crc32",
@@ -41,6 +42,7 @@ impl ChecksumName {
         }
     }
 
+    /// Returns the XML element name used by multipart `ListParts` responses.
     pub(crate) fn xml_element_name(self) -> &'static str {
         match self {
             Self::Crc32 => "ChecksumCRC32",
@@ -60,6 +62,7 @@ impl ChecksumName {
         }
     }
 
+    /// Resolves a supported S3 checksum header name to its algorithm.
     pub(crate) fn from_header_name(name: &str) -> Option<Self> {
         CHECKSUM_NAMES
             .iter()
@@ -101,10 +104,12 @@ pub struct ChecksumRequest {
 }
 
 impl ChecksumRequest {
+    /// Parses checksum headers from a request without trailing headers.
     pub fn from_headers(headers: &HeaderMap) -> Result<Self, S3Error> {
         Self::from_headers_and_trailers(headers, &BTreeMap::new())
     }
 
+    /// Parses checksum headers and trailers, rejecting unsupported or duplicate inputs.
     pub fn from_headers_and_trailers(
         headers: &HeaderMap,
         trailers: &BTreeMap<String, String>,
@@ -131,6 +136,7 @@ impl ChecksumRequest {
         })
     }
 
+    /// Validates the supplied digests against every checksum requested by the client.
     pub fn validate(&self, digests: &ChecksumDigests) -> Result<(), S3Error> {
         if let Some(expected) = &self.content_md5
             && expected.as_slice() != digests.md5.as_slice()
@@ -183,10 +189,12 @@ impl ChecksumRequest {
         Ok(())
     }
 
+    /// Returns checksum values that should be echoed in the S3 response.
     pub fn checksum_values(&self) -> BTreeMap<String, String> {
         self.checksum_values.clone()
     }
 
+    /// Builds response checksum values from final digests for the originally requested algorithms.
     pub(crate) fn checksum_values_for_digests(
         &self,
         digests: &ChecksumDigests,
@@ -225,26 +233,32 @@ impl ChecksumRequest {
         values
     }
 
+    /// Returns whether Content-MD5 must be calculated and validated.
     pub(crate) fn requires_md5(&self) -> bool {
         self.content_md5.is_some()
     }
 
+    /// Returns whether CRC32 must be calculated and validated.
     pub(crate) fn requires_crc32(&self) -> bool {
         self.checksum_crc32.is_some()
     }
 
+    /// Returns whether CRC32C must be calculated and validated.
     pub(crate) fn requires_crc32c(&self) -> bool {
         self.checksum_crc32c.is_some()
     }
 
+    /// Returns whether SHA-1 must be calculated and validated.
     pub(crate) fn requires_sha1(&self) -> bool {
         self.checksum_sha1.is_some()
     }
 
+    /// Returns whether SHA-256 must be calculated and validated.
     pub(crate) fn requires_sha256(&self) -> bool {
         self.checksum_sha256.is_some()
     }
 
+    /// Returns whether SHA-512 must be calculated and validated.
     pub(crate) fn requires_sha512(&self) -> bool {
         self.checksum_sha512.is_some()
     }
@@ -260,6 +274,7 @@ pub struct ChecksumDigests {
     pub crc32c: u32,
 }
 
+/// Recomputes response checksum headers requested before upload processing changed bytes.
 pub(crate) fn checksum_values_for_requested_headers(
     requested: &BTreeMap<String, String>,
     digests: &ChecksumDigests,

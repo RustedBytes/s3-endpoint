@@ -17,6 +17,10 @@ use crate::{
     },
 };
 
+/// Authenticates an HTTP request through the custom provider or built-in auth.
+///
+/// Custom authentication is tried first when configured. If no provider is
+/// registered, the returned future validates SigV4 or anonymous access.
 pub(crate) fn authenticate_request(
     state: &AppState,
     request: &Request<Body>,
@@ -47,6 +51,10 @@ pub(crate) fn authenticate_request(
     }
 }
 
+/// Resolves the S3 bucket and object key from request path and host headers.
+///
+/// Resolution honors the configured virtual-hosted-style base domain and maps
+/// target parsing failures to `InvalidRequest` with the request path resource.
 pub(crate) fn resolve_request_target(
     state: &AppState,
     request: &Request<Body>,
@@ -63,6 +71,7 @@ pub(crate) fn resolve_request_target(
     .map_err(|err| S3Error::invalid_request(err.to_string()).with_resource(path))
 }
 
+/// Resolves the S3 bucket from request path and host headers.
 pub(crate) fn resolve_request_bucket(
     state: &AppState,
     request: &Request<Body>,
@@ -79,6 +88,7 @@ pub(crate) fn resolve_request_bucket(
     .map_err(|err| S3Error::invalid_request(err.to_string()).with_resource(path))
 }
 
+/// Applies target, static auth, and custom authorization policy checks.
 pub(crate) fn authorize_request(
     state: &AppState,
     auth_context: &auth::AuthContext,
@@ -100,6 +110,7 @@ pub(crate) fn authorize_request(
     })
 }
 
+/// Validates an empty-body operation's fixed SHA-256 payload hash, when supplied.
 pub(crate) fn validate_empty_payload_hash(request: &Request<Body>) -> Result<(), S3Error> {
     let empty_payload_digest = sha2::Sha256::digest([]);
     validate_fixed_sha256_payload_hash(request.headers(), empty_payload_digest.as_ref())

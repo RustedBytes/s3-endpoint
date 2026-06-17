@@ -100,6 +100,7 @@ impl StagedObject {
         remove_file_if_exists(path).await
     }
 
+    /// Disarms cleanup and returns the staged object ID and file path for commit.
     pub(super) fn into_parts(self) -> (Uuid, PathBuf) {
         let Self {
             temp_id,
@@ -132,6 +133,7 @@ impl TempPartWriter {
         remove_file_if_exists(path).await
     }
 
+    /// Disarms cleanup and returns the part path and writer for commit.
     pub(super) fn into_parts(self) -> (PathBuf, BufWriter<File>) {
         let Self {
             path,
@@ -148,6 +150,7 @@ pub(super) struct TempFileCleanup {
 }
 
 impl TempFileCleanup {
+    /// Arms best-effort cleanup for a temporary file path.
     pub(super) fn new(path: PathBuf) -> Self {
         Self { path: Some(path) }
     }
@@ -172,6 +175,7 @@ impl Drop for TempFileCleanup {
     }
 }
 
+/// Discards a temporary object and logs cleanup failure at debug level.
 pub(super) async fn discard_temp_object(temp: TempObjectWriter, reason: &'static str) {
     if let Err(error) = temp.discard().await {
         tracing::debug!(
@@ -182,6 +186,7 @@ pub(super) async fn discard_temp_object(temp: TempObjectWriter, reason: &'static
     }
 }
 
+/// Discards a staged object and logs cleanup failure at debug level.
 pub(super) async fn discard_staged_object(staged: StagedObject, reason: &'static str) {
     if let Err(error) = staged.discard().await {
         tracing::debug!(

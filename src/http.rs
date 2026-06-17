@@ -10,6 +10,7 @@ pub(crate) struct RouterOptions {
     pub health_path: Option<String>,
 }
 
+/// Builds the default Axum router with S3 routes and `/health`.
 pub fn router(state: AppState) -> Router {
     router_with_options(
         state,
@@ -19,6 +20,7 @@ pub fn router(state: AppState) -> Router {
     )
 }
 
+/// Builds the Axum router with internal route options.
 pub(crate) fn router_with_options(state: AppState, options: RouterOptions) -> Router {
     let router = Router::new()
         .route("/", any(handlers::s3::handle_s3_request))
