@@ -1,0 +1,151 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Check docs
+        run: RUSTDOCFLAGS="-D missing_docs" cargo doc --no-deps
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  sdk-smoke:
+    name: SDK smoke (${{ matrix.client }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        client: ["boto3", "aws-cli", "go-sdk", "java-sdk", "js-sdk"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Install Go
+        if: matrix.client == 'go-sdk'
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Install Java
+        if: matrix.client == 'java-sdk'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Install Node
+        if: matrix.client == 'js-sdk'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: tests/sdk/js-smoke/package-lock.json
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build server
+        run: cargo build --locked
+
+      - name: Install Python SDK dependencies
+        if: matrix.client == 'boto3'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install boto3
+
+      - name: Install AWS CLI
+        if: matrix.client == 'aws-cli'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install awscli
+
+      - name: Install JS SDK dependencies
+        if: matrix.client == 'js-sdk'
+        working-directory: tests/sdk/js-smoke
+        run: npm ci
+
+      - name: Start server
+        run: |
+          mkdir -p "$RUNNER_TEMP/s3-data"
+          target/debug/s3-endpoint \
+            --addr 127.0.0.1:9000 \
+            --storage-root "$RUNNER_TEMP/s3-data" \
+            --access-key-id test \
+            --secret-key testsecret \
+            --region us-east-1 \
+            >"$RUNNER_TEMP/s3-endpoint.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/s3-endpoint.pid"
+          for _ in $(seq 1 50); do
+            if curl -fsS http://127.0.0.1:9000/health >/dev/null; then
+              exit 0
+            fi
+            sleep 0.2
+          done
+          cat "$RUNNER_TEMP/s3-endpoint.log"
+          exit 1
+
+      - name: Run boto3 smoke test
+        if: matrix.client == 'boto3'
+        run: |
+          python tests/sdk/boto3_smoke.py
+          python tests/sdk/presigned_curl_smoke.py
+
+      - name: Run AWS CLI smoke test
+        if: matrix.client == 'aws-cli'
+        run: tests/sdk/aws_cli_smoke.sh
+
+      - name: Run Go SDK smoke test
+        if: matrix.client == 'go-sdk'
+        working-directory: tests/sdk/go-smoke
+        run: go run .
+
+      - name: Run Java SDK smoke test
+        if: matrix.client == 'java-sdk'
+        working-directory: tests/sdk/java-smoke
+        run: mvn --batch-mode --no-transfer-progress compile exec:java
+
+      - name: Run JS SDK smoke test
+        if: matrix.client == 'js-sdk'
+        working-directory: tests/sdk/js-smoke
+        run: npm run smoke
+
+      - name: Stop server
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/s3-endpoint.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/s3-endpoint.pid")" || true
+          fi
+          if [ -f "$RUNNER_TEMP/s3-endpoint.log" ]; then
+            cat "$RUNNER_TEMP/s3-endpoint.log"
+          fi

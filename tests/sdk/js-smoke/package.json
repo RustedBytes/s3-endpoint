@@ -1,0 +1,16 @@
+{
+  "name": "js-smoke",
+  "version": "1.0.0",
+  "description": "AWS SDK for JavaScript v3 smoke test for s3-endpoint",
+  "main": "index.js",
+  "scripts": {
+    "smoke": "node index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "UNLICENSED",
+  "type": "commonjs",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1070.0"
+  }
+}

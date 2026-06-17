@@ -1,1 +1,4 @@
 /target
+.venv*/
+node_modules/
+tests/sdk/java-smoke/target/
