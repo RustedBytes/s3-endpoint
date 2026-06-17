@@ -3,7 +3,7 @@
 use std::{fmt, future::Future, sync::Arc, time::Duration};
 
 use axum::{
-    http::{HeaderMap, Method, StatusCode, Uri},
+    http::{self, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     response::Response,
 };
 use chrono::{DateTime, Utc};
@@ -55,19 +55,44 @@ pub enum RequestPrincipal {
     },
 }
 
+const MAX_TENANT_ID_LEN: usize = 256;
+
 /// Stable tenant identifier used by tenant limit hooks.
+///
+/// Tenant IDs are security-relevant stable identifiers used for quota keys,
+/// metrics, logs, and application-owned limit stores. Prefer [`TenantId::parse`]
+/// when accepting IDs from custom authentication systems.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct TenantId(String);
 
 impl TenantId {
-    /// Creates a tenant ID from a non-empty value.
+    /// Creates a tenant ID without validation.
+    ///
+    /// This constructor is retained for source compatibility. New code should
+    /// prefer [`TenantId::parse`] so empty, control-character, or oversized IDs
+    /// are rejected before they reach quota keys, logs, or external stores.
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
+    }
+
+    /// Parses a tenant ID from an application-provided value.
+    pub fn parse(value: impl Into<String>) -> Result<Self, TenantIdError> {
+        let value = value.into();
+        validate_tenant_id(&value)?;
+        Ok(Self(value))
     }
 
     /// Returns the tenant ID as a string slice.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub(crate) fn from_principal(principal: &RequestPrincipal) -> Result<Self, TenantIdError> {
+        match principal {
+            RequestPrincipal::Anonymous => Self::parse("anonymous"),
+            RequestPrincipal::AccessKey { access_key_id } => Self::parse(access_key_id.as_str()),
+            RequestPrincipal::Custom { id } => Self::parse(id.clone()),
+        }
     }
 }
 
@@ -89,7 +114,57 @@ impl fmt::Display for TenantId {
     }
 }
 
+/// Tenant ID validation error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TenantIdError {
+    /// Tenant ID is empty.
+    Empty,
+    /// Tenant ID is longer than the supported maximum.
+    TooLong {
+        /// Maximum accepted tenant ID length in bytes.
+        max_len: usize,
+    },
+    /// Tenant ID contains an ASCII control character.
+    ControlCharacter,
+}
+
+impl fmt::Display for TenantIdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("tenant ID must not be empty"),
+            Self::TooLong { max_len } => {
+                write!(formatter, "tenant ID must be at most {max_len} bytes")
+            }
+            Self::ControlCharacter => {
+                formatter.write_str("tenant ID must not contain control characters")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TenantIdError {}
+
+fn validate_tenant_id(value: &str) -> Result<(), TenantIdError> {
+    if value.is_empty() {
+        return Err(TenantIdError::Empty);
+    }
+    if value.len() > MAX_TENANT_ID_LEN {
+        return Err(TenantIdError::TooLong {
+            max_len: MAX_TENANT_ID_LEN,
+        });
+    }
+    if value.chars().any(char::is_control) {
+        return Err(TenantIdError::ControlCharacter);
+    }
+    Ok(())
+}
+
 /// Request data passed to a custom authentication provider.
+///
+/// Headers can include credentials such as `Authorization`,
+/// `x-amz-security-token`, signed headers, and application tokens. Avoid
+/// logging them directly; use [`redacted_headers`] when diagnostic logging needs
+/// header names and non-sensitive values.
 #[derive(Clone, Debug)]
 pub struct AuthenticationRequest {
     /// HTTP method.
@@ -127,11 +202,21 @@ impl AuthenticationResult {
     }
 
     /// Authenticates the request as an application-defined principal.
+    ///
+    /// This constructor is retained for compatibility. Prefer
+    /// [`AuthenticationResult::try_custom`] for user-supplied IDs so invalid
+    /// tenant identifiers are rejected at the authentication boundary.
     pub fn custom(id: impl Into<String>) -> Self {
         Self {
             principal: RequestPrincipal::Custom { id: id.into() },
             access_key_id: None,
         }
+    }
+
+    /// Authenticates the request as a validated application-defined principal.
+    pub fn try_custom(id: impl Into<String>) -> Result<Self, TenantIdError> {
+        let tenant = TenantId::parse(id)?;
+        Ok(Self::custom(tenant.as_str().to_owned()))
     }
 
     /// Returns the authenticated principal.
@@ -221,6 +306,10 @@ pub struct TargetContext {
 }
 
 /// Upload policy context passed before an upload body is accepted.
+///
+/// Headers can include signed request data, metadata, and application-provided
+/// values. Avoid logging them directly; use [`redacted_headers`] for diagnostic
+/// output.
 #[derive(Clone, Debug)]
 pub struct UploadPolicyContext {
     /// Request ID attached to this request.
@@ -233,6 +322,29 @@ pub struct UploadPolicyContext {
     pub action: S3Action,
     /// Request headers.
     pub headers: HeaderMap,
+}
+
+/// Returns a copy of headers with security-sensitive values replaced.
+///
+/// This helper is intended for application hook diagnostics. It redacts common
+/// S3 and HTTP credential headers while preserving other names and values.
+pub fn redacted_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut redacted = headers.clone();
+    for name in [
+        http::header::AUTHORIZATION.as_str(),
+        "proxy-authorization",
+        "x-api-key",
+        "x-auth-token",
+        "x-amz-security-token",
+        "x-amz-server-side-encryption-customer-key",
+        "x-amz-server-side-encryption-customer-key-md5",
+        "x-amz-server-side-encryption-context",
+    ] {
+        if redacted.contains_key(name) {
+            redacted.insert(name, HeaderValue::from_static("<redacted>"));
+        }
+    }
+    redacted
 }
 
 /// Per-tenant operation limit context passed before and after request handling.
@@ -608,6 +720,65 @@ mod tests {
             })
             .as_str(),
             "tenant-a"
+        );
+    }
+
+    #[test]
+    fn tenant_id_parse_rejects_unsafe_values() {
+        assert_eq!(TenantId::parse("").unwrap_err(), TenantIdError::Empty);
+        assert_eq!(
+            TenantId::parse("tenant\nid").unwrap_err(),
+            TenantIdError::ControlCharacter
+        );
+        assert_eq!(
+            TenantId::parse("x".repeat(MAX_TENANT_ID_LEN + 1)).unwrap_err(),
+            TenantIdError::TooLong {
+                max_len: MAX_TENANT_ID_LEN
+            }
+        );
+    }
+
+    #[test]
+    fn authentication_result_try_custom_validates_id() {
+        let result = AuthenticationResult::try_custom("tenant-a").expect("custom auth");
+        assert_eq!(
+            result.principal(),
+            &RequestPrincipal::Custom {
+                id: "tenant-a".to_owned()
+            }
+        );
+
+        assert_eq!(
+            AuthenticationResult::try_custom("tenant\rid").unwrap_err(),
+            TenantIdError::ControlCharacter
+        );
+    }
+
+    #[test]
+    fn redacted_headers_masks_sensitive_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("secret"),
+        );
+        headers.insert("x-api-key", HeaderValue::from_static("api-secret"));
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain"),
+        );
+
+        let redacted = redacted_headers(&headers);
+        assert_eq!(
+            redacted.get(http::header::AUTHORIZATION),
+            Some(&HeaderValue::from_static("<redacted>"))
+        );
+        assert_eq!(
+            redacted.get("x-api-key"),
+            Some(&HeaderValue::from_static("<redacted>"))
+        );
+        assert_eq!(
+            redacted.get(http::header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/plain"))
         );
     }
 }

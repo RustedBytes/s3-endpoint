@@ -57,7 +57,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .and_then(|value| value.to_str().ok())
                 == Some("let-me-in")
             {
-                return Ok(s3_endpoint::hooks::AuthenticationResult::custom("tenant-a"));
+                return s3_endpoint::hooks::AuthenticationResult::try_custom("tenant-a")
+                    .map_err(|err| S3Error::access_denied(err.to_string()));
             }
             Err(S3Error::access_denied("invalid api key"))
         })
@@ -127,7 +128,20 @@ the default `/health` route and no upload processors.
 
 When `authentication_provider` is configured, it replaces the built-in static
 SigV4/anonymous authentication path. Leave it unset to keep the default S3
-SigV4 behavior, including signed aws-chunked upload verification.
+SigV4 behavior, including signed aws-chunked upload verification. Target,
+upload, authorization, and tenant-limit hooks still run after custom
+authentication succeeds.
+
+Hook contexts can expose sensitive request data. `AuthenticationRequest` and
+`UploadPolicyContext` include headers that may contain `Authorization`,
+`x-amz-security-token`, signed headers, application API keys, and user metadata.
+Do not log raw headers. Use `s3_endpoint::hooks::redacted_headers(...)` when
+diagnostics need header names or non-sensitive values.
+
+Custom authentication principal IDs are used as tenant IDs for per-tenant
+limits. Prefer `AuthenticationResult::try_custom(...)` for user-supplied IDs so
+empty, control-character, or oversized IDs are rejected before they reach quota
+stores, logs, or metrics.
 
 ## Developer Tuning Hooks
 
@@ -156,6 +170,16 @@ authentication and before handler execution; providers may return an S3 error,
 an operation timeout, and/or an owned permit guard. The crate calls
 `finish_operation` once for every begun operation with the final status, S3
 error details when present, timeout flag, and decoded upload bytes when known.
+
+## Optional Security Audit
+
+This crate does not require `cargo-audit`, but maintainers can run an advisory
+scan locally or in CI:
+
+```sh
+cargo install cargo-audit
+cargo audit
+```
 
 ## Register Processors
 

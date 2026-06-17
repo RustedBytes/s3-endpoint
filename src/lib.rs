@@ -505,7 +505,8 @@ impl AppBuilder {
     ///
     /// When configured, this provider replaces the built-in static SigV4 and
     /// anonymous authentication path. Built-in SigV4 remains the default when
-    /// no custom provider is registered.
+    /// no custom provider is registered. Target, upload, authorization, and
+    /// tenant-limit hooks still run after custom authentication succeeds.
     pub fn authentication_provider<P>(mut self, provider: P) -> Self
     where
         P: AuthenticationProvider,
@@ -647,11 +648,11 @@ pub fn router(state: AppState) -> Router {
 mod tests {
     use super::*;
     use axum::{
-        body::{Body, to_bytes},
+        body::{Body, Bytes, to_bytes},
         http::{HeaderMap, HeaderValue, Request, StatusCode, header},
     };
-    use futures_util::future::BoxFuture;
-    use std::sync::Mutex;
+    use futures_util::{future::BoxFuture, stream};
+    use std::{convert::Infallible, path::Path, sync::Mutex, time::Duration};
     use tower::ServiceExt;
 
     #[tokio::test]
@@ -1366,6 +1367,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn custom_auth_with_invalid_principal_id_is_rejected() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let app = AppState::builder(config::Config::new(temp_dir.path().to_path_buf()))
+            .request_id_factory(|| {
+                s3::types::RequestId::parse("invalid-principal").expect("request id")
+            })
+            .authentication_provider(|_request: hooks::AuthenticationRequest| async {
+                Ok(hooks::AuthenticationResult::custom("tenant\nid"))
+            })
+            .build_router()
+            .await
+            .expect("router");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/test-bucket")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-amz-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("invalid-principal")
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_auth_success_still_runs_downstream_policies() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let app = AppState::builder(config::Config::new(temp_dir.path().to_path_buf()))
+            .authentication_provider(|_request: hooks::AuthenticationRequest| async {
+                hooks::AuthenticationResult::try_custom("tenant-a")
+                    .map_err(|err| error::S3Error::access_denied(err.to_string()))
+            })
+            .authorization_policy(|_context: hooks::AuthorizationContext| {
+                Err(error::S3Error::access_denied("policy denied"))
+            })
+            .build_router()
+            .await
+            .expect("router");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/test-bucket")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn timed_out_put_object_discards_temporary_object_file() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let app = AppState::builder(
+            config::Config::builder(temp_dir.path())
+                .allow_anonymous(true)
+                .build(),
+        )
+        .tenant_limits_provider(RecordingTenantLimitsProvider {
+            begins: Arc::new(Mutex::new(Vec::new())),
+            finishes: Arc::new(Mutex::new(Vec::new())),
+            timeout: Some(Duration::from_millis(1)),
+            permit_drops: None,
+        })
+        .upload_processor_fn("slow", |_upload| async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(middleware::UploadProcessorAction::Keep)
+        })
+        .build_router()
+        .await
+        .expect("router");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/test-bucket/slow.txt")
+                    .header(header::CONTENT_LENGTH, "4")
+                    .body(Body::from("slow"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_dir_empty_eventually(&temp_dir.path().join("tmp")).await;
+    }
+
+    #[tokio::test]
+    async fn timed_out_upload_part_discards_temporary_part_file() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let app = AppState::builder(
+            config::Config::builder(temp_dir.path())
+                .allow_anonymous(true)
+                .build(),
+        )
+        .tenant_limits_provider(RecordingTenantLimitsProvider {
+            begins: Arc::new(Mutex::new(Vec::new())),
+            finishes: Arc::new(Mutex::new(Vec::new())),
+            timeout: Some(Duration::from_millis(1)),
+            permit_drops: None,
+        })
+        .build_router()
+        .await
+        .expect("router");
+
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/test-bucket/parts.txt?uploads")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("create response");
+        assert_eq!(create.status(), StatusCode::OK);
+        let body = to_bytes(create.into_body(), usize::MAX)
+            .await
+            .expect("create body");
+        let upload_id = upload_id_from_xml(std::str::from_utf8(&body).expect("xml utf8"));
+
+        let delayed = stream::once(async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok::<_, Infallible>(Bytes::from_static(b"part"))
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!(
+                        "/test-bucket/parts.txt?partNumber=1&uploadId={}",
+                        upload_id
+                    ))
+                    .header(header::CONTENT_LENGTH, "4")
+                    .body(Body::from_stream(delayed))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_no_multipart_tmp_files_eventually(temp_dir.path()).await;
+    }
+
+    #[tokio::test]
     async fn tenant_limits_provider_permit_is_dropped_after_completion() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let drops = Arc::new(Mutex::new(0_usize));
@@ -1591,6 +1752,63 @@ mod tests {
         fn drop(&mut self) {
             *self.0.lock().expect("drop counter lock") += 1;
         }
+    }
+
+    async fn assert_dir_empty_eventually(path: &Path) {
+        for _ in 0..20 {
+            if dir_entries(path).is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("directory still contains entries: {:?}", dir_entries(path));
+    }
+
+    async fn assert_no_multipart_tmp_files_eventually(root: &Path) {
+        for _ in 0..20 {
+            let tmp_files = multipart_tmp_files(root);
+            if tmp_files.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "multipart storage still contains tmp files: {:?}",
+            multipart_tmp_files(root)
+        );
+    }
+
+    fn dir_entries(path: &Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(path)
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.expect("dir entry").path())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    fn multipart_tmp_files(root: &Path) -> Vec<std::path::PathBuf> {
+        let multipart = root.join("multipart");
+        let mut tmp_files = Vec::new();
+        for upload in dir_entries(&multipart) {
+            for entry in dir_entries(&upload) {
+                if entry
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".tmp"))
+                {
+                    tmp_files.push(entry);
+                }
+            }
+        }
+        tmp_files
+    }
+
+    fn upload_id_from_xml(xml: &str) -> String {
+        let start = xml.find("<UploadId>").expect("upload id start") + "<UploadId>".len();
+        let end = xml[start..].find("</UploadId>").expect("upload id end") + start;
+        xml[start..end].to_owned()
     }
 
     struct NamedProcessor(&'static str);

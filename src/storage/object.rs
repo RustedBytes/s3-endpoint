@@ -56,6 +56,7 @@ impl FileObjectStore {
 
         Ok(TempObjectWriter {
             temp_id,
+            cleanup: crate::storage::temp::TempFileCleanup::new(path.clone()),
             path,
             writer: BufWriter::new(file),
             bucket: bucket.clone(),
@@ -86,10 +87,7 @@ impl FileObjectStore {
         staged: StagedObject,
         metadata: ObjectMetadata,
     ) -> Result<(), StoreError> {
-        let StagedObject {
-            temp_id,
-            path: temp_path,
-        } = staged;
+        let (temp_id, temp_path) = staged.into_parts();
 
         let object_path = self.object_path(&metadata.bucket, &metadata.key);
         let metadata_path = self.metadata_path(&metadata.bucket, &metadata.key);

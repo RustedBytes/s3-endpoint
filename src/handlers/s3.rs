@@ -216,9 +216,11 @@ async fn dispatch(
                 operation: operation.clone(),
             })?;
             let auth_context = authenticate_request(&state, &request).await?;
+            let tenant = TenantId::from_principal(&auth_context.principal)
+                .map_err(|_| S3Error::access_denied("invalid custom principal id"))?;
             let tenant_context = TenantLimitContext {
                 request_id: request_id.clone(),
-                tenant: TenantId::from(&auth_context.principal),
+                tenant,
                 principal: auth_context.principal.clone(),
                 method,
                 action: operation.action(),

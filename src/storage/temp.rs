@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use tokio::{
     fs::{self, File},
     io::{AsyncWriteExt, BufWriter},
+    runtime::Handle,
 };
 use uuid::Uuid;
 
@@ -13,6 +14,7 @@ use crate::s3::types::{BucketName, ObjectKey};
 pub struct TempObjectWriter {
     pub(super) temp_id: Uuid,
     pub(super) path: PathBuf,
+    pub(super) cleanup: TempFileCleanup,
     /// Buffered writer for the temporary object body.
     pub writer: BufWriter<File>,
     #[allow(dead_code)]
@@ -28,18 +30,30 @@ impl TempObjectWriter {
         let Self {
             temp_id,
             path,
+            mut cleanup,
             writer,
             bucket: _,
             key: _,
         } = self;
         drop(writer);
-        Ok(StagedObject { temp_id, path })
+        cleanup.disarm();
+        Ok(StagedObject {
+            temp_id,
+            cleanup: TempFileCleanup::new(path.clone()),
+            path,
+        })
     }
 
     /// Discards the temporary object body.
     pub async fn discard(self) -> Result<(), StoreError> {
-        let Self { path, writer, .. } = self;
+        let Self {
+            path,
+            writer,
+            mut cleanup,
+            ..
+        } = self;
         drop(writer);
+        cleanup.disarm();
         remove_file_if_exists(path).await
     }
 }
@@ -48,6 +62,7 @@ impl TempObjectWriter {
 pub struct StagedObject {
     pub(super) temp_id: Uuid,
     pub(super) path: PathBuf,
+    pub(super) cleanup: TempFileCleanup,
 }
 
 impl StagedObject {
@@ -78,13 +93,28 @@ impl StagedObject {
 
     /// Deletes staged bytes.
     pub async fn discard(self) -> Result<(), StoreError> {
-        remove_file_if_exists(self.path).await
+        let Self {
+            path, mut cleanup, ..
+        } = self;
+        cleanup.disarm();
+        remove_file_if_exists(path).await
+    }
+
+    pub(super) fn into_parts(self) -> (Uuid, PathBuf) {
+        let Self {
+            temp_id,
+            path,
+            mut cleanup,
+        } = self;
+        cleanup.disarm();
+        (temp_id, path)
     }
 }
 
 /// Temporary part writer returned by [`crate::storage::FileMultipartStore::create_temp_part`].
 pub struct TempPartWriter {
     pub(super) path: PathBuf,
+    pub(super) cleanup: TempFileCleanup,
     /// Buffered writer for the temporary part body.
     pub writer: BufWriter<File>,
 }
@@ -92,9 +122,53 @@ pub struct TempPartWriter {
 impl TempPartWriter {
     /// Discards the temporary part body.
     pub async fn discard(self) -> Result<(), StoreError> {
-        let Self { path, writer } = self;
+        let Self {
+            path,
+            writer,
+            mut cleanup,
+        } = self;
         drop(writer);
+        cleanup.disarm();
         remove_file_if_exists(path).await
+    }
+
+    pub(super) fn into_parts(self) -> (PathBuf, BufWriter<File>) {
+        let Self {
+            path,
+            writer,
+            mut cleanup,
+        } = self;
+        cleanup.disarm();
+        (path, writer)
+    }
+}
+
+pub(super) struct TempFileCleanup {
+    path: Option<PathBuf>,
+}
+
+impl TempFileCleanup {
+    pub(super) fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for TempFileCleanup {
+    fn drop(&mut self) {
+        let Some(path) = self.path.take() else {
+            return;
+        };
+        if let Ok(handle) = Handle::try_current() {
+            handle.spawn(async move {
+                let _ = remove_file_if_exists(path).await;
+            });
+        } else {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 

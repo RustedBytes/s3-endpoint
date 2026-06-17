@@ -176,6 +176,7 @@ impl FileMultipartStore {
         let file = File::create(&path).await?;
 
         Ok(TempPartWriter {
+            cleanup: crate::storage::temp::TempFileCleanup::new(path.clone()),
             path,
             writer: BufWriter::new(file),
         })
@@ -193,10 +194,7 @@ impl FileMultipartStore {
         temp: TempPartWriter,
         part: CommittedPart,
     ) -> Result<PartMetadata, StoreError> {
-        let TempPartWriter {
-            path: temp_path,
-            writer,
-        } = temp;
+        let (temp_path, writer) = temp.into_parts();
         drop(writer);
 
         let session = self.get_open_upload(upload_id)?;
