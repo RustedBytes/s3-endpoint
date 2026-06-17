@@ -1,6 +1,5 @@
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, fmt, path::PathBuf, sync::Arc};
 
-use chrono::Utc;
 use dashmap::DashMap;
 use md5::Digest as _;
 use tokio::{
@@ -10,15 +9,16 @@ use tokio::{
 use uuid::Uuid;
 
 use super::{
-    CommittedPart, CompletedPart, FileObjectStore, ObjectMetadata, PartMetadata, StoreError,
-    TempPartWriter, UploadId, UploadMetadata, UploadProcessing, UploadSession, UploadState,
+    CommittedPart, CompleteUploadRequest, ObjectMetadata, PartMetadata, StoreError, TempPartWriter,
+    UploadId, UploadMetadata, UploadSession, UploadState,
     complete_checksum::MultipartCompleteChecksumState,
     fs_util::{create_parent_dir, remove_file_if_exists},
     temp::{discard_staged_object, discard_temp_object},
 };
 use crate::{
-    body::{checksum::ChecksumRequest, upload::summarize_staged_upload},
-    config::{AccessKeyId, UploadLimits},
+    body::upload::summarize_staged_upload,
+    config::{AccessKeyId, MultipartLifecycle},
+    hooks::SharedClock,
     middleware::{
         UploadProcessorContext, UploadProcessorOperation, process_staged_upload,
         processors_are_empty,
@@ -27,10 +27,22 @@ use crate::{
 };
 
 /// Filesystem-backed multipart upload store.
-#[derive(Debug)]
 pub struct FileMultipartStore {
     pub(super) root: Arc<PathBuf>,
     pub(super) sessions: DashMap<UploadId, UploadSession>,
+    lifecycle: MultipartLifecycle,
+    clock: SharedClock,
+}
+
+impl fmt::Debug for FileMultipartStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FileMultipartStore")
+            .field("root", &self.root)
+            .field("sessions", &self.sessions)
+            .field("lifecycle", &self.lifecycle)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FileMultipartStore {
@@ -39,13 +51,32 @@ impl FileMultipartStore {
     /// Loads open sessions from disk, removes terminal sessions, and removes
     /// stale temporary files. Returns an error for filesystem or JSON failures.
     pub async fn new(root: PathBuf) -> Result<Self, StoreError> {
+        Self::new_with_options(
+            root,
+            MultipartLifecycle::default(),
+            Arc::new(crate::hooks::SystemClock),
+        )
+        .await
+    }
+
+    /// Opens or creates a multipart store with explicit lifecycle and clock options.
+    pub async fn new_with_options(
+        root: PathBuf,
+        lifecycle: MultipartLifecycle,
+        clock: SharedClock,
+    ) -> Result<Self, StoreError> {
         fs::create_dir_all(root.join("multipart")).await?;
         let store = Self {
             root: Arc::new(root),
             sessions: DashMap::new(),
+            lifecycle,
+            clock,
         };
         store.load_sessions().await?;
-        store.cleanup_stale_temp_files().await?;
+        if store.lifecycle.cleanup_on_startup && store.lifecycle.remove_stale_temp_files_on_startup
+        {
+            store.cleanup_stale_temp_files().await?;
+        }
         Ok(store)
     }
 
@@ -62,7 +93,7 @@ impl FileMultipartStore {
             upload_id: upload_id.clone(),
             bucket,
             key,
-            initiated: Utc::now(),
+            initiated: self.clock.now(),
             state: UploadState::Open,
             owner_access_key_id,
             metadata,
@@ -114,7 +145,7 @@ impl FileMultipartStore {
             etag,
             md5,
             checksums,
-            last_modified: Utc::now(),
+            last_modified: self.clock.now(),
         };
 
         let session_snapshot = {
@@ -202,7 +233,7 @@ impl FileMultipartStore {
             etag: part.etag,
             md5: part.md5,
             checksums: part.checksums,
-            last_modified: Utc::now(),
+            last_modified: self.clock.now(),
         };
 
         let session_snapshot = {
@@ -264,26 +295,12 @@ impl FileMultipartStore {
     /// Temporary object data is discarded on validation or I/O failure.
     pub async fn complete_upload(
         &self,
-        object_store: &FileObjectStore,
-        upload_id: &UploadId,
-        requested_parts: &[CompletedPart],
-        checksum_request: &ChecksumRequest,
-        upload_limits: &UploadLimits,
-        processing: UploadProcessing<'_>,
+        request: CompleteUploadRequest<'_>,
     ) -> Result<ObjectMetadata, StoreError> {
+        let upload_id = request.upload_id;
         let session = self.begin_completion(upload_id).await?;
         let result = self
-            .complete_upload_after_transition(
-                session,
-                MultipartCompletion {
-                    object_store,
-                    upload_id,
-                    requested_parts,
-                    checksum_request,
-                    upload_limits,
-                    processing,
-                },
-            )
+            .complete_upload_after_transition(session, request)
             .await;
         if result.is_err() {
             self.restore_open_upload(upload_id).await;
@@ -294,14 +311,15 @@ impl FileMultipartStore {
     async fn complete_upload_after_transition(
         &self,
         session: UploadSession,
-        completion: MultipartCompletion<'_>,
+        completion: CompleteUploadRequest<'_>,
     ) -> Result<ObjectMetadata, StoreError> {
-        let MultipartCompletion {
+        let CompleteUploadRequest {
             object_store,
             upload_id,
             requested_parts,
             checksum_request,
             upload_limits,
+            io_tuning,
             processing,
         } = completion;
         let mut validated_parts = Vec::with_capacity(requested_parts.len());
@@ -336,7 +354,7 @@ impl FileMultipartStore {
                     return Err(StoreError::Io(error));
                 }
             };
-            let mut buffer = [0_u8; 64 * 1024];
+            let mut buffer = vec![0_u8; io_tuning.multipart_complete_buffer_size];
             loop {
                 let read = match file.read(&mut buffer).await {
                     Ok(read) => read,
@@ -384,7 +402,12 @@ impl FileMultipartStore {
         let staged = process_staged_upload(processing.upload_processors, staged, context)
             .await
             .map_err(StoreError::Processor)?;
-        let final_body = match summarize_staged_upload(staged.path()).await {
+        let final_body = match summarize_staged_upload(
+            staged.path(),
+            io_tuning.upload_summary_buffer_size,
+        )
+        .await
+        {
             Ok(final_body) => final_body,
             Err(error) => {
                 discard_staged_object(staged, "multipart complete final summary failure").await;
@@ -423,7 +446,7 @@ impl FileMultipartStore {
             tagging: session.metadata.tagging,
             user_metadata: session.metadata.user_metadata,
             checksums,
-            last_modified: Utc::now(),
+            last_modified: self.clock.now(),
         };
 
         object_store
@@ -544,14 +567,18 @@ impl FileMultipartStore {
                 Ok(bytes) => {
                     let session: UploadSession = serde_json::from_slice(&bytes)?;
                     if !session.is_open() {
-                        if let Err(error) = fs::remove_dir_all(entry.path()).await
-                            && error.kind() != std::io::ErrorKind::NotFound
+                        if self.lifecycle.cleanup_on_startup
+                            && self.lifecycle.remove_terminal_uploads_on_startup
                         {
-                            tracing::warn!(
-                                upload_id = %session.upload_id.as_str(),
-                                error = %error,
-                                "terminal multipart upload cleanup failed on startup"
-                            );
+                            self.remove_upload_dir_on_startup(entry.path(), &session)
+                                .await;
+                        }
+                        continue;
+                    }
+                    if self.incomplete_upload_is_expired(&session) {
+                        if self.lifecycle.cleanup_on_startup {
+                            self.remove_upload_dir_on_startup(entry.path(), &session)
+                                .await;
                         }
                         continue;
                     }
@@ -589,13 +616,27 @@ impl FileMultipartStore {
         }
         Ok(())
     }
-}
 
-struct MultipartCompletion<'a> {
-    object_store: &'a FileObjectStore,
-    upload_id: &'a UploadId,
-    requested_parts: &'a [CompletedPart],
-    checksum_request: &'a ChecksumRequest,
-    upload_limits: &'a UploadLimits,
-    processing: UploadProcessing<'a>,
+    fn incomplete_upload_is_expired(&self, session: &UploadSession) -> bool {
+        let Some(max_age) = self.lifecycle.abort_incomplete_after else {
+            return false;
+        };
+        self.clock
+            .now()
+            .signed_duration_since(session.initiated)
+            .to_std()
+            .is_ok_and(|age| age > max_age)
+    }
+
+    async fn remove_upload_dir_on_startup(&self, path: PathBuf, session: &UploadSession) {
+        if let Err(error) = fs::remove_dir_all(path).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                upload_id = %session.upload_id.as_str(),
+                error = %error,
+                "multipart upload cleanup failed on startup"
+            );
+        }
+    }
 }

@@ -15,13 +15,14 @@ Use the fluent config builders when embedding the endpoint in an Axum server.
 router.
 
 ```rust
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::Duration};
 
 use s3_endpoint::{
     AppState,
-    config::{AuthConfig, Config},
+    config::{AuthConfig, Config, IoTuning, MultipartLifecycle, S3Action},
     error::S3Error,
 };
+use axum::http::{self, HeaderValue};
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -37,6 +38,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = AppState::builder(config)
         .health_path("/ready")
+        .io_tuning(
+            IoTuning::builder()
+                .object_stream_buffer_size(128 * 1024)
+                .multipart_complete_buffer_size(128 * 1024)
+                .build(),
+        )
+        .multipart_lifecycle(
+            MultipartLifecycle::builder()
+                .abort_incomplete_after(Duration::from_secs(7 * 24 * 60 * 60))
+                .build(),
+        )
+        .disable_operation(S3Action::DeleteObject)
         .authentication_provider(|request| async move {
             if request
                 .headers
@@ -47,6 +60,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(s3_endpoint::hooks::AuthenticationResult::custom("tenant-a"));
             }
             Err(S3Error::access_denied("invalid api key"))
+        })
+        .target_policy(|request| {
+            if request
+                .key
+                .as_ref()
+                .is_some_and(|key| key.as_str().starts_with("internal/"))
+            {
+                return Err(S3Error::access_denied("internal prefix is reserved"));
+            }
+            Ok(())
+        })
+        .upload_policy(|request| {
+            if request
+                .headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                == Some("application/x-msdownload")
+            {
+                return Err(S3Error::access_denied("content type is blocked"));
+            }
+            Ok(())
         })
         .upload_processor_fn("antivirus", |upload| async move {
             let bytes = upload.read_current().await?;
@@ -60,6 +94,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err(S3Error::access_denied("bucket is blocked by application policy"));
             }
             Ok(())
+        })
+        .on_response(|_context, mut response| async move {
+            response
+                .headers_mut()
+                .insert("x-service", HeaderValue::from_static("embedded-s3"));
+            response
         })
         .on_error(|context, error| async move {
             tracing::warn!(
@@ -88,6 +128,24 @@ the default `/health` route and no upload processors.
 When `authentication_provider` is configured, it replaces the built-in static
 SigV4/anonymous authentication path. Leave it unset to keep the default S3
 SigV4 behavior, including signed aws-chunked upload verification.
+
+## Developer Tuning Hooks
+
+The embedded API exposes several additive controls:
+
+- `disable_operation` and `operation_policy` gate implemented S3 operations
+  before handlers run.
+- `target_policy` applies app-specific bucket/key rules after S3 target parsing.
+- `upload_policy` rejects uploads before the body is read or staged.
+- `on_response` can add or adjust HTTP headers on successful or error
+  responses.
+- `clock` supplies deterministic timestamps for tests or coordinated runtime
+  clocks.
+- `io_tuning` adjusts object stream, staged upload summary, and multipart
+  completion buffer sizes.
+- `multipart_lifecycle` controls startup cleanup and incomplete upload expiry.
+- `object_store` and `multipart_store` replace the default filesystem stores
+  with implementations of the public storage traits.
 
 ## Register Processors
 

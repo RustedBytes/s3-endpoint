@@ -26,8 +26,9 @@ use crate::{
         upload_metadata::collect_upload_metadata,
         validate_empty_request_body_headers, validate_supported_request_body_length,
     },
+    hooks::UploadPolicyContext,
     s3::types::{ETag, PartNumber, RequestId, UploadId},
-    storage::{CompletedPart, StoreError, UploadProcessing, UploadSession},
+    storage::{CompleteUploadRequest, CompletedPart, StoreError, UploadProcessing, UploadSession},
 };
 
 const COMPLETE_MULTIPART_XML_LIMIT: usize = 8 * 1024 * 1024;
@@ -49,6 +50,13 @@ pub(crate) async fn create_multipart_upload(
         Some(&target.key),
         S3Action::CreateMultipartUpload,
     )?;
+    state.allow_upload(UploadPolicyContext {
+        request_id: request_id.clone(),
+        bucket: target.bucket.clone(),
+        key: target.key.clone(),
+        action: S3Action::CreateMultipartUpload,
+        headers: request.headers().clone(),
+    })?;
     let session = state
         .multipart_store
         .create_upload(
@@ -93,6 +101,13 @@ pub(crate) async fn upload_part(
         Some(&session.key),
         S3Action::UploadPart,
     )?;
+    state.allow_upload(UploadPolicyContext {
+        request_id: request_id.clone(),
+        bucket: session.bucket.clone(),
+        key: session.key.clone(),
+        action: S3Action::UploadPart,
+        headers: headers.clone(),
+    })?;
 
     let _part_writer_permit = state.try_acquire_multipart_part_writer()?;
     let _aws_chunked_decoder_permit = state.try_acquire_aws_chunked_decoder(&headers)?;
@@ -324,17 +339,18 @@ pub(crate) async fn complete_multipart_upload(
 
     let metadata = state
         .multipart_store
-        .complete_upload(
-            &state.object_store,
-            &upload_id,
-            &parts,
-            &checksum_request,
-            &state.config.upload_limits,
-            UploadProcessing {
+        .complete_upload(CompleteUploadRequest {
+            object_store: state.object_store.as_ref(),
+            upload_id: &upload_id,
+            requested_parts: &parts,
+            checksum_request: &checksum_request,
+            upload_limits: &state.config.upload_limits,
+            io_tuning: &state.io_tuning,
+            processing: UploadProcessing {
                 request_id,
                 upload_processors: state.upload_processors(),
             },
-        )
+        })
         .await
         .map_err(map_store_error)?;
 

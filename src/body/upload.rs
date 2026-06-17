@@ -39,7 +39,10 @@ pub(crate) struct FinalUploadBody {
     pub digests: ChecksumDigests,
 }
 
-pub(crate) async fn summarize_staged_upload(path: &Path) -> Result<FinalUploadBody, S3Error> {
+pub(crate) async fn summarize_staged_upload(
+    path: &Path,
+    buffer_size: usize,
+) -> Result<FinalUploadBody, S3Error> {
     let mut file = File::open(path)
         .await
         .map_err(|err| S3Error::internal(format!("failed to open staged upload: {err}")))?;
@@ -50,7 +53,7 @@ pub(crate) async fn summarize_staged_upload(path: &Path) -> Result<FinalUploadBo
     let mut crc32 = CRC32.digest();
     let mut crc32c = CRC32C.digest();
     let mut size = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; buffer_size];
 
     loop {
         let read = file

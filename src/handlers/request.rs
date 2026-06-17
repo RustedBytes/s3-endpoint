@@ -10,7 +10,7 @@ use crate::{
     body::upload::validate_fixed_sha256_payload_hash,
     config::S3Action,
     error::S3Error,
-    hooks::{AuthenticationRequest, AuthorizationContext},
+    hooks::{AuthenticationRequest, AuthorizationContext, TargetContext},
     s3::{
         target::{resolve_bucket_name, resolve_s3_target},
         types::{BucketName, ObjectKey, S3Target},
@@ -86,6 +86,11 @@ pub(crate) fn authorize_request(
     key: Option<&ObjectKey>,
     action: S3Action,
 ) -> Result<(), S3Error> {
+    state.allow_target(TargetContext {
+        bucket: bucket.clone(),
+        key: key.cloned(),
+        action,
+    })?;
     auth::authorize(&state.auth, auth_context, bucket, action)?;
     state.authorize_with_policy(AuthorizationContext {
         principal: auth_context.principal.clone(),

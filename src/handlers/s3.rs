@@ -11,7 +11,7 @@ use std::time::Instant;
 use crate::{
     AppState,
     error::S3Error,
-    hooks::{S3ErrorContext, S3RequestContext},
+    hooks::{OperationContext, S3ErrorContext, S3RequestContext, S3ResponseContext},
     s3::{
         target::{has_virtual_hosted_bucket, resolve_bucket_name, resolve_s3_target},
         types::{BucketName, ObjectKey, PartNumber, RequestId, S3Operation, UploadId},
@@ -63,16 +63,27 @@ pub async fn handle_s3_request(State(state): State<AppState>, request: Request<B
             .await
             {
                 Ok(response) => response,
-                Err(error) => error_response(state, operation, request_id.clone(), error).await,
+                Err(error) => error_response(&state, operation, request_id.clone(), error).await,
             }
         }
-        Err(error) => error_response(state, operation, request_id.clone(), error).await,
+        Err(error) => error_response(&state, operation, request_id.clone(), error).await,
     };
     let response = if method == Method::HEAD {
         without_head_response_body(response)
     } else {
         response
     };
+    let response = state
+        .map_response(
+            S3ResponseContext {
+                request_id: request_id.clone(),
+                operation: operation.to_owned(),
+                bucket: log_context.bucket.clone(),
+                key: log_context.key.clone(),
+            },
+            response,
+        )
+        .await;
     if let Some(decoded_bytes) = response.extensions().get::<DecodedBodyBytes>() {
         log_context.decoded_bytes = Some(decoded_bytes.0);
     }
@@ -93,7 +104,7 @@ pub async fn handle_s3_request(State(state): State<AppState>, request: Request<B
 }
 
 async fn error_response(
-    state: AppState,
+    state: &AppState,
     operation: &str,
     request_id: RequestId,
     error: S3Error,
@@ -189,20 +200,42 @@ async fn dispatch(
     request_id: &RequestId,
 ) -> Result<Response, S3Error> {
     match detected_operation? {
-        DetectedOperation::Implemented(S3Operation::HeadObject) => {
+        DetectedOperation::Implemented(operation) => {
+            state.allow_operation(OperationContext {
+                action: operation.action(),
+                operation: operation.clone(),
+            })?;
+            dispatch_implemented_operation(state, request, operation, request_id).await
+        }
+        DetectedOperation::ListObjectsV2 => {
+            Err(S3Error::not_implemented("ListObjectsV2 is not implemented"))
+        }
+        DetectedOperation::Unsupported => Err(S3Error::invalid_argument("list-type must be 2")),
+        DetectedOperation::MethodNotAllowed => Err(S3Error::method_not_allowed()),
+    }
+}
+
+async fn dispatch_implemented_operation(
+    state: AppState,
+    request: Request<Body>,
+    operation: S3Operation,
+    request_id: &RequestId,
+) -> Result<Response, S3Error> {
+    match operation {
+        S3Operation::HeadObject => {
             return crate::handlers::head_object::head_object(state, request, request_id).await;
         }
-        DetectedOperation::Implemented(S3Operation::HeadBucket) => {
+        S3Operation::HeadBucket => {
             return crate::handlers::head_bucket::head_bucket(state, request, request_id).await;
         }
-        DetectedOperation::Implemented(S3Operation::CreateMultipartUpload) => {
+        S3Operation::CreateMultipartUpload => {
             return crate::handlers::multipart::create_multipart_upload(state, request, request_id)
                 .await;
         }
-        DetectedOperation::Implemented(S3Operation::UploadPart {
+        S3Operation::UploadPart {
             upload_id,
             part_number,
-        }) => {
+        } => {
             return crate::handlers::multipart::upload_part(
                 state,
                 request,
@@ -212,37 +245,32 @@ async fn dispatch(
             )
             .await;
         }
-        DetectedOperation::Implemented(S3Operation::PutObject) => {
+        S3Operation::PutObject => {
             return crate::handlers::put_object::handle_put_object(state, request, request_id)
                 .await;
         }
-        DetectedOperation::Implemented(S3Operation::CompleteMultipartUpload { upload_id }) => {
+        S3Operation::CompleteMultipartUpload { upload_id } => {
             return crate::handlers::multipart::complete_multipart_upload(
                 state, request, request_id, upload_id,
             )
             .await;
         }
-        DetectedOperation::Implemented(S3Operation::AbortMultipartUpload { upload_id }) => {
+        S3Operation::AbortMultipartUpload { upload_id } => {
             return crate::handlers::multipart::abort_multipart_upload(
                 state, request, request_id, upload_id,
             )
             .await;
         }
-        DetectedOperation::Implemented(S3Operation::DeleteObject) => {
+        S3Operation::DeleteObject => {
             return crate::handlers::delete_object::delete_object(state, request, request_id).await;
         }
-        DetectedOperation::Implemented(S3Operation::ListParts { upload_id }) => {
+        S3Operation::ListParts { upload_id } => {
             return crate::handlers::multipart::list_parts(state, request, request_id, upload_id)
                 .await;
         }
-        DetectedOperation::Implemented(S3Operation::GetObject) => {
+        S3Operation::GetObject => {
             return crate::handlers::get_object::get_object(state, request, request_id).await;
         }
-        DetectedOperation::ListObjectsV2 => {
-            Err(S3Error::not_implemented("ListObjectsV2 is not implemented"))
-        }
-        DetectedOperation::Unsupported => Err(S3Error::invalid_argument("list-type must be 2")),
-        DetectedOperation::MethodNotAllowed => Err(S3Error::method_not_allowed()),
     }
 }
 

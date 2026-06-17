@@ -357,6 +357,24 @@ impl S3Operation {
             Self::DeleteObject => "DeleteObject",
         }
     }
+
+    /// Returns the IAM-style action used by authorization and tuning policies.
+    pub fn action(&self) -> crate::config::S3Action {
+        match self {
+            Self::PutObject => crate::config::S3Action::PutObject,
+            Self::CreateMultipartUpload => crate::config::S3Action::CreateMultipartUpload,
+            Self::UploadPart { .. } => crate::config::S3Action::UploadPart,
+            Self::CompleteMultipartUpload { .. } => {
+                crate::config::S3Action::CompleteMultipartUpload
+            }
+            Self::AbortMultipartUpload { .. } => crate::config::S3Action::AbortMultipartUpload,
+            Self::ListParts { .. } => crate::config::S3Action::ListMultipartUploadParts,
+            Self::HeadBucket => crate::config::S3Action::HeadBucket,
+            Self::HeadObject => crate::config::S3Action::HeadObject,
+            Self::GetObject => crate::config::S3Action::GetObject,
+            Self::DeleteObject => crate::config::S3Action::DeleteObject,
+        }
+    }
 }
 
 /// Parsed `x-amz-content-sha256` payload hash mode.

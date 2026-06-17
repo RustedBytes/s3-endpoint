@@ -2,13 +2,17 @@
 
 use std::{fmt, future::Future, sync::Arc};
 
-use axum::http::{HeaderMap, Method, Uri};
+use axum::{
+    http::{HeaderMap, Method, Uri},
+    response::Response,
+};
+use chrono::{DateTime, Utc};
 use futures_util::future::BoxFuture;
 
 use crate::{
     config::{AccessKeyId, S3Action},
     error::S3Error,
-    s3::types::{BucketName, ObjectKey, PartNumber, RequestId, UploadId},
+    s3::types::{BucketName, ObjectKey, PartNumber, RequestId, S3Operation, UploadId},
 };
 
 /// Shared request observer object.
@@ -21,6 +25,16 @@ pub type SharedRequestIdFactory = Arc<dyn RequestIdFactory>;
 pub type SharedAuthorizationPolicy = Arc<dyn AuthorizationPolicy>;
 /// Shared authentication provider object.
 pub type SharedAuthenticationProvider = Arc<dyn AuthenticationProvider>;
+/// Shared operation policy object.
+pub type SharedOperationPolicy = Arc<dyn OperationPolicy>;
+/// Shared target policy object.
+pub type SharedTargetPolicy = Arc<dyn TargetPolicy>;
+/// Shared upload policy object.
+pub type SharedUploadPolicy = Arc<dyn UploadPolicy>;
+/// Shared response mapper object.
+pub type SharedResponseMapper = Arc<dyn ResponseMapper>;
+/// Shared clock object.
+pub type SharedClock = Arc<dyn Clock>;
 
 /// Authenticated principal visible to tuning hooks.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -124,6 +138,19 @@ pub struct S3ErrorContext {
     pub operation: String,
 }
 
+/// Response mapping context passed before an HTTP response is returned.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct S3ResponseContext {
+    /// Request ID attached to this request.
+    pub request_id: RequestId,
+    /// Detected S3 operation name or `InvalidRequest`.
+    pub operation: String,
+    /// Parsed bucket when target parsing succeeded.
+    pub bucket: Option<BucketName>,
+    /// Parsed object key when target parsing succeeded.
+    pub key: Option<ObjectKey>,
+}
+
 /// Authorization context passed to custom authorization policies.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthorizationContext {
@@ -135,6 +162,41 @@ pub struct AuthorizationContext {
     pub key: Option<ObjectKey>,
     /// S3 action being authorized.
     pub action: S3Action,
+}
+
+/// Operation policy context passed before an implemented operation is dispatched.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationContext {
+    /// Parsed S3 operation.
+    pub operation: S3Operation,
+    /// IAM-style action for this operation.
+    pub action: S3Action,
+}
+
+/// Target policy context passed after bucket/key parsing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TargetContext {
+    /// Bucket being accessed.
+    pub bucket: BucketName,
+    /// Object key when the request targets an object.
+    pub key: Option<ObjectKey>,
+    /// S3 action being performed.
+    pub action: S3Action,
+}
+
+/// Upload policy context passed before an upload body is accepted.
+#[derive(Clone, Debug)]
+pub struct UploadPolicyContext {
+    /// Request ID attached to this request.
+    pub request_id: RequestId,
+    /// Bucket being written.
+    pub bucket: BucketName,
+    /// Object key being written.
+    pub key: ObjectKey,
+    /// S3 action being performed.
+    pub action: S3Action,
+    /// Request headers.
+    pub headers: HeaderMap,
 }
 
 /// Read-only observer for parsed S3 requests.
@@ -191,6 +253,30 @@ where
     }
 }
 
+/// Maps successful or error HTTP responses before they are returned.
+pub trait ResponseMapper: Send + Sync + 'static {
+    /// Returns the response that should be sent to the caller.
+    fn map_response<'a>(
+        &'a self,
+        context: S3ResponseContext,
+        response: Response,
+    ) -> BoxFuture<'a, Response>;
+}
+
+impl<F, Fut> ResponseMapper for F
+where
+    F: Fn(S3ResponseContext, Response) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Response> + Send + 'static,
+{
+    fn map_response<'a>(
+        &'a self,
+        context: S3ResponseContext,
+        response: Response,
+    ) -> BoxFuture<'a, Response> {
+        Box::pin((self)(context, response))
+    }
+}
+
 /// Creates request IDs for S3 responses and hooks.
 pub trait RequestIdFactory: Send + Sync + 'static {
     /// Creates a request ID.
@@ -206,6 +292,51 @@ where
     }
 }
 
+/// Additional operation policy evaluated before dispatch.
+pub trait OperationPolicy: Send + Sync + 'static {
+    /// Returns `Ok(())` to allow dispatch or an S3 error to reject it.
+    fn allow_operation(&self, context: OperationContext) -> Result<(), S3Error>;
+}
+
+impl<F> OperationPolicy for F
+where
+    F: Fn(OperationContext) -> Result<(), S3Error> + Send + Sync + 'static,
+{
+    fn allow_operation(&self, context: OperationContext) -> Result<(), S3Error> {
+        (self)(context)
+    }
+}
+
+/// Additional bucket/key policy evaluated after target parsing.
+pub trait TargetPolicy: Send + Sync + 'static {
+    /// Returns `Ok(())` to allow the target or an S3 error to reject it.
+    fn allow_target(&self, context: TargetContext) -> Result<(), S3Error>;
+}
+
+impl<F> TargetPolicy for F
+where
+    F: Fn(TargetContext) -> Result<(), S3Error> + Send + Sync + 'static,
+{
+    fn allow_target(&self, context: TargetContext) -> Result<(), S3Error> {
+        (self)(context)
+    }
+}
+
+/// Additional upload policy evaluated before upload bytes are read.
+pub trait UploadPolicy: Send + Sync + 'static {
+    /// Returns `Ok(())` to allow the upload or an S3 error to reject it.
+    fn allow_upload(&self, context: UploadPolicyContext) -> Result<(), S3Error>;
+}
+
+impl<F> UploadPolicy for F
+where
+    F: Fn(UploadPolicyContext) -> Result<(), S3Error> + Send + Sync + 'static,
+{
+    fn allow_upload(&self, context: UploadPolicyContext) -> Result<(), S3Error> {
+        (self)(context)
+    }
+}
+
 /// Additional authorization policy evaluated after static allow-lists.
 pub trait AuthorizationPolicy: Send + Sync + 'static {
     /// Returns `Ok(())` to allow the request or an S3 error to deny it.
@@ -218,6 +349,31 @@ where
 {
     fn authorize(&self, context: AuthorizationContext) -> Result<(), S3Error> {
         (self)(context)
+    }
+}
+
+/// Clock used for object and multipart timestamps.
+pub trait Clock: Send + Sync + 'static {
+    /// Returns the current UTC timestamp.
+    fn now(&self) -> DateTime<Utc>;
+}
+
+impl<F> Clock for F
+where
+    F: Fn() -> DateTime<Utc> + Send + Sync + 'static,
+{
+    fn now(&self) -> DateTime<Utc> {
+        (self)()
+    }
+}
+
+/// System UTC clock.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> DateTime<Utc> {
+        Utc::now()
     }
 }
 

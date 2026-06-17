@@ -18,6 +18,7 @@ use crate::{
         upload_metadata::collect_upload_metadata,
         validate_supported_request_body_length,
     },
+    hooks::UploadPolicyContext,
     middleware::{
         UploadProcessorContext, UploadProcessorOperation, process_staged_upload,
         processors_are_empty,
@@ -45,6 +46,13 @@ pub(crate) async fn handle_put_object(
         Some(&target.key),
         S3Action::PutObject,
     )?;
+    state.allow_upload(UploadPolicyContext {
+        request_id: request_id.clone(),
+        bucket: target.bucket.clone(),
+        key: target.key.clone(),
+        action: S3Action::PutObject,
+        headers: headers.clone(),
+    })?;
 
     let upload_metadata = collect_upload_metadata(&headers)?;
     let _object_writer_permit = state.try_acquire_object_writer()?;
@@ -96,13 +104,16 @@ pub(crate) async fn handle_put_object(
             return Err(error);
         }
     };
-    let final_body = match summarize_staged_upload(staged.path()).await {
-        Ok(final_body) => final_body,
-        Err(error) => {
-            let _ = staged.discard().await;
-            return Err(error);
-        }
-    };
+    let final_body =
+        match summarize_staged_upload(staged.path(), state.io_tuning.upload_summary_buffer_size)
+            .await
+        {
+            Ok(final_body) => final_body,
+            Err(error) => {
+                let _ = staged.discard().await;
+                return Err(error);
+            }
+        };
     if final_body.size.get() > state.config.upload_limits.max_object_size {
         let _ = staged.discard().await;
         return Err(S3Error::entity_too_large(
@@ -130,7 +141,7 @@ pub(crate) async fn handle_put_object(
         tagging: upload_metadata.tagging,
         user_metadata: upload_metadata.user_metadata,
         checksums: response_checksums.clone(),
-        last_modified: chrono::Utc::now(),
+        last_modified: state.now(),
     };
 
     state

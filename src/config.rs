@@ -4,6 +4,7 @@ use std::{
     num::{NonZeroU64, NonZeroUsize},
     path::PathBuf,
     str::FromStr,
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -99,6 +100,165 @@ impl ConfigBuilder {
     /// Returns the constructed configuration.
     pub fn build(self) -> Config {
         self.config
+    }
+}
+
+/// Low-level I/O buffer sizes used by upload summarization, multipart
+/// completion, and object streaming.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IoTuning {
+    /// Buffer size used while summarizing staged uploads.
+    pub upload_summary_buffer_size: usize,
+    /// Buffer size used while copying multipart parts into the final object.
+    pub multipart_complete_buffer_size: usize,
+    /// Chunk size used while streaming object responses.
+    pub object_stream_buffer_size: usize,
+}
+
+impl Default for IoTuning {
+    fn default() -> Self {
+        const DEFAULT_BUFFER_SIZE: usize = 64 * 1024;
+        Self {
+            upload_summary_buffer_size: DEFAULT_BUFFER_SIZE,
+            multipart_complete_buffer_size: DEFAULT_BUFFER_SIZE,
+            object_stream_buffer_size: DEFAULT_BUFFER_SIZE,
+        }
+    }
+}
+
+impl IoTuning {
+    /// Creates a fluent I/O tuning builder using default buffer sizes.
+    pub fn builder() -> IoTuningBuilder {
+        IoTuningBuilder {
+            tuning: Self::default(),
+        }
+    }
+
+    /// Validates configured buffer sizes.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.upload_summary_buffer_size == 0 {
+            return Err(ConfigError::InvalidIoTuning(
+                "upload_summary_buffer_size must be greater than 0",
+            ));
+        }
+        if self.multipart_complete_buffer_size == 0 {
+            return Err(ConfigError::InvalidIoTuning(
+                "multipart_complete_buffer_size must be greater than 0",
+            ));
+        }
+        if self.object_stream_buffer_size == 0 {
+            return Err(ConfigError::InvalidIoTuning(
+                "object_stream_buffer_size must be greater than 0",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Fluent builder for [`IoTuning`].
+#[derive(Clone, Debug)]
+pub struct IoTuningBuilder {
+    tuning: IoTuning,
+}
+
+impl IoTuningBuilder {
+    /// Sets the staged upload summary buffer size.
+    pub fn upload_summary_buffer_size(mut self, value: usize) -> Self {
+        self.tuning.upload_summary_buffer_size = value;
+        self
+    }
+
+    /// Sets the multipart completion copy buffer size.
+    pub fn multipart_complete_buffer_size(mut self, value: usize) -> Self {
+        self.tuning.multipart_complete_buffer_size = value;
+        self
+    }
+
+    /// Sets the object response stream chunk size.
+    pub fn object_stream_buffer_size(mut self, value: usize) -> Self {
+        self.tuning.object_stream_buffer_size = value;
+        self
+    }
+
+    /// Returns the constructed I/O tuning.
+    pub fn build(self) -> IoTuning {
+        self.tuning
+    }
+}
+
+/// Multipart cleanup and lifecycle tuning.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultipartLifecycle {
+    /// Whether startup initialization removes terminal and stale temporary upload data.
+    pub cleanup_on_startup: bool,
+    /// Whether terminal completed/aborted upload directories are removed on startup.
+    pub remove_terminal_uploads_on_startup: bool,
+    /// Whether stale multipart `*.tmp` files are removed on startup.
+    pub remove_stale_temp_files_on_startup: bool,
+    /// Maximum age for incomplete multipart uploads loaded on startup.
+    pub abort_incomplete_after: Option<Duration>,
+}
+
+impl Default for MultipartLifecycle {
+    fn default() -> Self {
+        Self {
+            cleanup_on_startup: true,
+            remove_terminal_uploads_on_startup: true,
+            remove_stale_temp_files_on_startup: true,
+            abort_incomplete_after: None,
+        }
+    }
+}
+
+impl MultipartLifecycle {
+    /// Creates a fluent multipart lifecycle builder using default cleanup behavior.
+    pub fn builder() -> MultipartLifecycleBuilder {
+        MultipartLifecycleBuilder {
+            lifecycle: Self::default(),
+        }
+    }
+}
+
+/// Fluent builder for [`MultipartLifecycle`].
+#[derive(Clone, Debug)]
+pub struct MultipartLifecycleBuilder {
+    lifecycle: MultipartLifecycle,
+}
+
+impl MultipartLifecycleBuilder {
+    /// Sets whether startup cleanup is enabled.
+    pub fn cleanup_on_startup(mut self, enabled: bool) -> Self {
+        self.lifecycle.cleanup_on_startup = enabled;
+        self
+    }
+
+    /// Sets whether terminal completed/aborted uploads are removed on startup.
+    pub fn remove_terminal_uploads_on_startup(mut self, enabled: bool) -> Self {
+        self.lifecycle.remove_terminal_uploads_on_startup = enabled;
+        self
+    }
+
+    /// Sets whether stale multipart temporary files are removed on startup.
+    pub fn remove_stale_temp_files_on_startup(mut self, enabled: bool) -> Self {
+        self.lifecycle.remove_stale_temp_files_on_startup = enabled;
+        self
+    }
+
+    /// Sets the maximum age for incomplete multipart uploads loaded on startup.
+    pub fn abort_incomplete_after(mut self, duration: Duration) -> Self {
+        self.lifecycle.abort_incomplete_after = Some(duration);
+        self
+    }
+
+    /// Clears the incomplete multipart upload age limit.
+    pub fn without_abort_incomplete_after(mut self) -> Self {
+        self.lifecycle.abort_incomplete_after = None;
+        self
+    }
+
+    /// Returns the constructed lifecycle tuning.
+    pub fn build(self) -> MultipartLifecycle {
+        self.lifecycle
     }
 }
 
@@ -329,6 +489,10 @@ pub enum ConfigError {
     /// Upload limit validation failed.
     #[error("invalid upload limit: {0}")]
     InvalidUploadLimit(&'static str),
+
+    /// I/O tuning validation failed.
+    #[error("invalid I/O tuning: {0}")]
+    InvalidIoTuning(&'static str),
 
     /// Auth configuration validation failed.
     #[error("invalid auth configuration: {0}")]

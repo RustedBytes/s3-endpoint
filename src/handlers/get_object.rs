@@ -63,14 +63,20 @@ pub(crate) async fn get_object(
                     header::CONTENT_RANGE,
                     format!("bytes {}-{}/{}", range.start, range.end, metadata.size),
                 );
-            apply_response_overrides(response, query)?
-                .body(Body::from_stream(file_stream_limited(file, range.len())))
+            apply_response_overrides(response, query)?.body(Body::from_stream(file_stream_limited(
+                file,
+                range.len(),
+                state.io_tuning.object_stream_buffer_size,
+            )))
         }
         None => {
             let response = crate::handlers::head_object::object_metadata_response_builder(
                 &metadata, request_id,
             );
-            apply_response_overrides(response, query)?.body(Body::from_stream(file_stream(file)))
+            apply_response_overrides(response, query)?.body(Body::from_stream(file_stream(
+                file,
+                state.io_tuning.object_stream_buffer_size,
+            )))
         }
     };
 
@@ -107,35 +113,45 @@ fn apply_response_overrides(
     Ok(response)
 }
 
-fn file_stream(file: File) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> {
-    stream::try_unfold(file, |mut file| async move {
-        let mut buffer = vec![0_u8; 64 * 1024];
+fn file_stream(
+    file: File,
+    buffer_size: usize,
+) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> {
+    stream::try_unfold((file, buffer_size), |(mut file, buffer_size)| async move {
+        let mut buffer = vec![0_u8; buffer_size];
         let read = file.read(&mut buffer).await?;
         if read == 0 {
             return Ok(None);
         }
         buffer.truncate(read);
-        Ok(Some((Bytes::from(buffer), file)))
+        Ok(Some((Bytes::from(buffer), (file, buffer_size))))
     })
 }
 
 fn file_stream_limited(
     file: File,
     bytes: u64,
+    buffer_size: usize,
 ) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> {
-    stream::try_unfold((file, bytes), |(mut file, remaining)| async move {
-        if remaining == 0 {
-            return Ok(None);
-        }
-        let read_limit = remaining.min(64 * 1024) as usize;
-        let mut buffer = vec![0_u8; read_limit];
-        let read = file.read(&mut buffer).await?;
-        if read == 0 {
-            return Ok(None);
-        }
-        buffer.truncate(read);
-        Ok(Some((Bytes::from(buffer), (file, remaining - read as u64))))
-    })
+    stream::try_unfold(
+        (file, bytes, buffer_size),
+        |(mut file, remaining, buffer_size)| async move {
+            if remaining == 0 {
+                return Ok(None);
+            }
+            let read_limit = remaining.min(buffer_size as u64) as usize;
+            let mut buffer = vec![0_u8; read_limit];
+            let read = file.read(&mut buffer).await?;
+            if read == 0 {
+                return Ok(None);
+            }
+            buffer.truncate(read);
+            Ok(Some((
+                Bytes::from(buffer),
+                (file, remaining - read as u64, buffer_size),
+            )))
+        },
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

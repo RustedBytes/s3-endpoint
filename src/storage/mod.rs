@@ -1,6 +1,8 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
+use futures_util::future::BoxFuture;
 use thiserror::Error;
+use tokio::fs::File;
 
 mod checksum;
 mod complete_checksum;
@@ -11,6 +13,11 @@ mod object;
 mod temp;
 
 use crate::error::S3Error;
+use crate::{
+    body::checksum::ChecksumRequest,
+    config::{AccessKeyId, IoTuning, UploadLimits},
+    s3::types::{BucketName, ObjectKey, PartNumber},
+};
 
 pub use crate::s3::types::UploadId;
 pub use checksum::{ChecksumAlgorithm, ChecksumType};
@@ -21,6 +28,220 @@ pub use model::{
 pub use multipart::FileMultipartStore;
 pub use object::FileObjectStore;
 pub use temp::{StagedObject, TempObjectWriter, TempPartWriter};
+
+/// Shared object store implementation.
+pub type SharedObjectStore = Arc<dyn ObjectStore>;
+/// Shared multipart store implementation.
+pub type SharedMultipartStore = Arc<dyn MultipartStore>;
+
+/// Object storage boundary used by request handlers.
+///
+/// The default implementation is [`FileObjectStore`]. Custom implementations
+/// can wrap the filesystem store or provide alternate persistence while
+/// preserving the same S3-visible behavior.
+pub trait ObjectStore: Send + Sync + 'static {
+    /// Creates a temporary object writer for a bucket/key.
+    fn create_temp_object<'a>(
+        &'a self,
+        bucket: &'a BucketName,
+        key: &'a ObjectKey,
+    ) -> BoxFuture<'a, Result<TempObjectWriter, StoreError>>;
+
+    /// Atomically publishes a staged object and metadata.
+    fn commit_staged_object<'a>(
+        &'a self,
+        staged: StagedObject,
+        metadata: ObjectMetadata,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    /// Reads committed object metadata.
+    fn head_object<'a>(
+        &'a self,
+        bucket: &'a BucketName,
+        key: &'a ObjectKey,
+    ) -> BoxFuture<'a, Result<Option<ObjectMetadata>, StoreError>>;
+
+    /// Opens a committed object for streaming.
+    fn open_object<'a>(
+        &'a self,
+        bucket: &'a BucketName,
+        key: &'a ObjectKey,
+    ) -> BoxFuture<'a, Result<Option<(ObjectMetadata, File)>, StoreError>>;
+
+    /// Deletes object metadata and bytes.
+    fn delete_object<'a>(
+        &'a self,
+        bucket: &'a BucketName,
+        key: &'a ObjectKey,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+}
+
+impl ObjectStore for FileObjectStore {
+    fn create_temp_object<'a>(
+        &'a self,
+        bucket: &'a BucketName,
+        key: &'a ObjectKey,
+    ) -> BoxFuture<'a, Result<TempObjectWriter, StoreError>> {
+        Box::pin(FileObjectStore::create_temp_object(self, bucket, key))
+    }
+
+    fn commit_staged_object<'a>(
+        &'a self,
+        staged: StagedObject,
+        metadata: ObjectMetadata,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(FileObjectStore::commit_staged_object(
+            self, staged, metadata,
+        ))
+    }
+
+    fn head_object<'a>(
+        &'a self,
+        bucket: &'a BucketName,
+        key: &'a ObjectKey,
+    ) -> BoxFuture<'a, Result<Option<ObjectMetadata>, StoreError>> {
+        Box::pin(FileObjectStore::head_object(self, bucket, key))
+    }
+
+    fn open_object<'a>(
+        &'a self,
+        bucket: &'a BucketName,
+        key: &'a ObjectKey,
+    ) -> BoxFuture<'a, Result<Option<(ObjectMetadata, File)>, StoreError>> {
+        Box::pin(FileObjectStore::open_object(self, bucket, key))
+    }
+
+    fn delete_object<'a>(
+        &'a self,
+        bucket: &'a BucketName,
+        key: &'a ObjectKey,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(FileObjectStore::delete_object(self, bucket, key))
+    }
+}
+
+/// Inputs for completing a multipart upload.
+pub struct CompleteUploadRequest<'a> {
+    /// Object store that receives the completed object.
+    pub object_store: &'a dyn ObjectStore,
+    /// Multipart upload ID.
+    pub upload_id: &'a UploadId,
+    /// Client-requested parts in completion order.
+    pub requested_parts: &'a [CompletedPart],
+    /// Requested checksum validation.
+    pub checksum_request: &'a ChecksumRequest,
+    /// Upload size limits.
+    pub upload_limits: &'a UploadLimits,
+    /// I/O buffer tuning.
+    pub io_tuning: &'a IoTuning,
+    /// Upload processing context.
+    pub processing: UploadProcessing<'a>,
+}
+
+/// Multipart storage boundary used by request handlers.
+pub trait MultipartStore: Send + Sync + 'static {
+    /// Creates and persists a new multipart upload session.
+    fn create_upload<'a>(
+        &'a self,
+        bucket: BucketName,
+        key: ObjectKey,
+        owner_access_key_id: Option<AccessKeyId>,
+        metadata: UploadMetadata,
+    ) -> BoxFuture<'a, Result<UploadSession, StoreError>>;
+
+    /// Returns a snapshot of an upload session.
+    fn get_upload(&self, upload_id: &UploadId) -> Option<UploadSession>;
+
+    /// Creates a temporary part writer for an open upload.
+    fn create_temp_part<'a>(
+        &'a self,
+        upload_id: &'a UploadId,
+        part_number: PartNumber,
+    ) -> BoxFuture<'a, Result<TempPartWriter, StoreError>>;
+
+    /// Atomically publishes a temporary part.
+    fn commit_part<'a>(
+        &'a self,
+        upload_id: &'a UploadId,
+        part_number: PartNumber,
+        temp: TempPartWriter,
+        part: CommittedPart,
+    ) -> BoxFuture<'a, Result<PartMetadata, StoreError>>;
+
+    /// Aborts an open upload and deletes its temporary storage.
+    fn abort_upload<'a>(&'a self, upload_id: &'a UploadId)
+    -> BoxFuture<'a, Result<(), StoreError>>;
+
+    /// Completes an open multipart upload into a committed object.
+    fn complete_upload<'a>(
+        &'a self,
+        request: CompleteUploadRequest<'a>,
+    ) -> BoxFuture<'a, Result<ObjectMetadata, StoreError>>;
+}
+
+impl MultipartStore for FileMultipartStore {
+    fn create_upload<'a>(
+        &'a self,
+        bucket: BucketName,
+        key: ObjectKey,
+        owner_access_key_id: Option<AccessKeyId>,
+        metadata: UploadMetadata,
+    ) -> BoxFuture<'a, Result<UploadSession, StoreError>> {
+        Box::pin(FileMultipartStore::create_upload(
+            self,
+            bucket,
+            key,
+            owner_access_key_id,
+            metadata,
+        ))
+    }
+
+    fn get_upload(&self, upload_id: &UploadId) -> Option<UploadSession> {
+        FileMultipartStore::get_upload(self, upload_id)
+    }
+
+    fn create_temp_part<'a>(
+        &'a self,
+        upload_id: &'a UploadId,
+        part_number: PartNumber,
+    ) -> BoxFuture<'a, Result<TempPartWriter, StoreError>> {
+        Box::pin(FileMultipartStore::create_temp_part(
+            self,
+            upload_id,
+            part_number,
+        ))
+    }
+
+    fn commit_part<'a>(
+        &'a self,
+        upload_id: &'a UploadId,
+        part_number: PartNumber,
+        temp: TempPartWriter,
+        part: CommittedPart,
+    ) -> BoxFuture<'a, Result<PartMetadata, StoreError>> {
+        Box::pin(FileMultipartStore::commit_part(
+            self,
+            upload_id,
+            part_number,
+            temp,
+            part,
+        ))
+    }
+
+    fn abort_upload<'a>(
+        &'a self,
+        upload_id: &'a UploadId,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(FileMultipartStore::abort_upload(self, upload_id))
+    }
+
+    fn complete_upload<'a>(
+        &'a self,
+        request: CompleteUploadRequest<'a>,
+    ) -> BoxFuture<'a, Result<ObjectMetadata, StoreError>> {
+        Box::pin(FileMultipartStore::complete_upload(self, request))
+    }
+}
 
 #[derive(Debug, Error)]
 /// Errors returned by filesystem object and multipart stores.
@@ -77,8 +298,8 @@ mod tests {
     };
     use axum::http::{HeaderMap, HeaderValue};
     use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-    use chrono::Utc;
-    use std::collections::BTreeMap;
+    use chrono::{TimeZone, Utc};
+    use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
     #[test]
     fn upload_session_deserialization_defaults_missing_state_to_open() {
@@ -170,20 +391,21 @@ mod tests {
             ChecksumRequest::from_headers(&HeaderMap::new()).expect("empty checksum request");
 
         let result = multipart_store
-            .complete_upload(
-                &object_store,
-                &upload.upload_id,
-                &[CompletedPart {
+            .complete_upload(CompleteUploadRequest {
+                object_store: &object_store,
+                upload_id: &upload.upload_id,
+                requested_parts: &[CompletedPart {
                     part_number: PartNumber::parse(1).expect("part number"),
                     etag: ETag::parse("\"missing\"").expect("etag"),
                 }],
-                &checksum_request,
-                &UploadLimits::default(),
-                UploadProcessing {
+                checksum_request: &checksum_request,
+                upload_limits: &UploadLimits::default(),
+                io_tuning: &crate::config::IoTuning::default(),
+                processing: UploadProcessing {
                     request_id: &RequestId::new(),
                     upload_processors: &[],
                 },
-            )
+            })
             .await;
 
         assert!(matches!(result, Err(StoreError::InvalidPart)));
@@ -259,6 +481,46 @@ mod tests {
                 .join(aborted_upload_id.as_str())
                 .exists()
         );
+    }
+
+    #[tokio::test]
+    async fn multipart_store_startup_removes_expired_open_upload_sessions() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let upload_id = UploadId::new();
+        let upload_dir = temp_dir.path().join("multipart").join(upload_id.as_str());
+        std::fs::create_dir_all(upload_dir.join("parts")).expect("create upload dir");
+        let now = Utc
+            .with_ymd_and_hms(2026, 6, 17, 12, 0, 0)
+            .single()
+            .expect("current time");
+        let session = UploadSession {
+            upload_id: upload_id.clone(),
+            bucket: BucketName::parse("test-bucket").expect("bucket"),
+            key: ObjectKey::parse("key.txt").expect("key"),
+            initiated: now - chrono::Duration::hours(2),
+            state: UploadState::Open,
+            owner_access_key_id: None,
+            metadata: UploadMetadata::default(),
+            parts: BTreeMap::new(),
+        };
+        std::fs::write(
+            upload_dir.join("session.json"),
+            serde_json::to_vec_pretty(&session).expect("session json"),
+        )
+        .expect("write session");
+
+        let store = FileMultipartStore::new_with_options(
+            temp_dir.path().to_path_buf(),
+            crate::config::MultipartLifecycle::builder()
+                .abort_incomplete_after(Duration::from_secs(60 * 60))
+                .build(),
+            Arc::new(move || now),
+        )
+        .await
+        .expect("store");
+
+        assert!(store.get_upload(&upload_id).is_none());
+        assert!(!upload_dir.exists());
     }
 
     #[test]
