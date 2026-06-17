@@ -46,6 +46,7 @@ pub(crate) async fn create_multipart_upload(
         &state,
         &auth_context,
         &target.bucket,
+        Some(&target.key),
         S3Action::CreateMultipartUpload,
     )?;
     let session = state
@@ -85,7 +86,13 @@ pub(crate) async fn upload_part(
     validate_upload_headers(request.headers())?;
     let headers = request.headers().clone();
     let session = validate_upload_session_target(&state, &request, &auth_context, &upload_id)?;
-    authorize_request(&state, &auth_context, &session.bucket, S3Action::UploadPart)?;
+    authorize_request(
+        &state,
+        &auth_context,
+        &session.bucket,
+        Some(&session.key),
+        S3Action::UploadPart,
+    )?;
 
     let _part_writer_permit = state.try_acquire_multipart_part_writer()?;
     let _aws_chunked_decoder_permit = state.try_acquire_aws_chunked_decoder(&headers)?;
@@ -169,6 +176,7 @@ pub(crate) async fn list_parts(
         &state,
         &auth_context,
         &session.bucket,
+        Some(&session.key),
         S3Action::ListMultipartUploadParts,
     )?;
     validate_empty_payload_hash(&request)?;
@@ -263,6 +271,7 @@ pub(crate) async fn abort_multipart_upload(
         &state,
         &auth_context,
         &session.bucket,
+        Some(&session.key),
         S3Action::AbortMultipartUpload,
     )?;
     validate_empty_payload_hash(&request)?;
@@ -294,6 +303,7 @@ pub(crate) async fn complete_multipart_upload(
         &state,
         &auth_context,
         &session.bucket,
+        Some(&session.key),
         S3Action::CompleteMultipartUpload,
     )?;
     let body = axum::body::to_bytes(request.into_body(), COMPLETE_MULTIPART_XML_LIMIT)

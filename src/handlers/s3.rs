@@ -11,9 +11,10 @@ use std::time::Instant;
 use crate::{
     AppState,
     error::S3Error,
+    hooks::{S3ErrorContext, S3RequestContext},
     s3::{
-        target::{has_virtual_hosted_bucket, resolve_s3_target},
-        types::{PartNumber, RequestId, S3Operation, UploadId},
+        target::{has_virtual_hosted_bucket, resolve_bucket_name, resolve_s3_target},
+        types::{BucketName, ObjectKey, PartNumber, RequestId, S3Operation, UploadId},
     },
 };
 
@@ -36,17 +37,36 @@ pub async fn handle_s3_request(State(state): State<AppState>, request: Request<B
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
-    let request_id = RequestId::new();
+    let request_id = state.request_id();
     let started_at = Instant::now();
+    state
+        .observe_request(S3RequestContext {
+            request_id: request_id.clone(),
+            method: method.clone(),
+            operation: operation.to_owned(),
+            bucket: log_context.bucket.clone(),
+            key: log_context.key.clone(),
+            upload_id: log_context.upload_id.clone(),
+            part_number: log_context.part_number,
+            content_length,
+        })
+        .await;
 
     let response = match state.try_acquire_s3_request() {
         Ok(_permit) => {
-            match dispatch(state, request, parsed_request.operation, &request_id).await {
+            match dispatch(
+                state.clone(),
+                request,
+                parsed_request.operation,
+                &request_id,
+            )
+            .await
+            {
                 Ok(response) => response,
-                Err(error) => error.into_response_with_request_id(&request_id),
+                Err(error) => error_response(state, operation, request_id.clone(), error).await,
             }
         }
-        Err(error) => error.into_response_with_request_id(&request_id),
+        Err(error) => error_response(state, operation, request_id.clone(), error).await,
     };
     let response = if method == Method::HEAD {
         without_head_response_body(response)
@@ -61,15 +81,33 @@ pub async fn handle_s3_request(State(state): State<AppState>, request: Request<B
         operation,
         status = response.status().as_u16(),
         duration_ms = started_at.elapsed().as_millis(),
-        bucket = log_context.bucket.as_deref().unwrap_or(""),
+        bucket = log_context.bucket.as_ref().map(BucketName::as_str).unwrap_or(""),
         key_sha256 = log_context.key_sha256.as_deref().unwrap_or(""),
-        upload_id = log_context.upload_id.as_deref().unwrap_or(""),
+        upload_id = log_context.upload_id.as_ref().map(UploadId::as_str).unwrap_or(""),
         part_number = log_context.part_number.map(PartNumber::get).unwrap_or_default(),
         request_content_length = content_length.unwrap_or_default(),
         decoded_bytes = log_context.decoded_bytes.unwrap_or_default(),
         "s3 request completed"
     );
     response
+}
+
+async fn error_response(
+    state: AppState,
+    operation: &str,
+    request_id: RequestId,
+    error: S3Error,
+) -> Response {
+    state
+        .map_error(
+            S3ErrorContext {
+                request_id: request_id.clone(),
+                operation: operation.to_owned(),
+            },
+            error,
+        )
+        .await
+        .into_response_with_request_id(&request_id)
 }
 
 #[derive(Debug)]
@@ -99,9 +137,10 @@ fn without_head_response_body(mut response: Response) -> Response {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct RequestLogContext {
-    bucket: Option<String>,
+    bucket: Option<BucketName>,
+    key: Option<ObjectKey>,
     key_sha256: Option<String>,
-    upload_id: Option<String>,
+    upload_id: Option<UploadId>,
     part_number: Option<PartNumber>,
     decoded_bytes: Option<u64>,
 }
@@ -120,22 +159,24 @@ fn request_log_context(
     query: &str,
 ) -> RequestLogContext {
     let mut context = RequestLogContext {
-        upload_id: query_param(query, "uploadId"),
+        upload_id: query_param(query, "uploadId").and_then(|value| UploadId::parse(value).ok()),
         part_number: query_param(query, "partNumber")
             .and_then(|value| value.parse::<PartNumber>().ok()),
         ..RequestLogContext::default()
     };
 
-    if let Ok(target) = resolve_s3_target(
-        request.uri().path(),
-        request
-            .headers()
-            .get(header::HOST)
-            .and_then(|value| value.to_str().ok()),
-        virtual_host_base_domain,
-    ) {
-        context.bucket = Some(target.bucket.as_str().to_owned());
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok());
+    if let Ok(target) = resolve_s3_target(request.uri().path(), host, virtual_host_base_domain) {
+        context.bucket = Some(target.bucket);
+        context.key = Some(target.key.clone());
         context.key_sha256 = Some(hex::encode(Sha256::digest(target.key.as_str().as_bytes())));
+    } else if let Ok(bucket) =
+        resolve_bucket_name(request.uri().path(), host, virtual_host_base_domain)
+    {
+        context.bucket = Some(bucket);
     }
 
     context
@@ -441,21 +482,29 @@ mod tests {
 
     #[test]
     fn request_log_context_hashes_key_and_keeps_multipart_ids() {
+        let upload_id = UploadId::new();
+        let uri = format!(
+            "/test-bucket/path/to/object.txt?partNumber=7&uploadId={}",
+            upload_id.as_str()
+        );
         let request = Request::builder()
             .method(Method::PUT)
-            .uri("/test-bucket/path/to/object.txt?partNumber=7&uploadId=upload-123")
+            .uri(uri)
             .body(Body::empty())
             .expect("request");
 
         let context = request_log_context(&request, None, request.uri().query().expect("query"));
 
-        assert_eq!(context.bucket.as_deref(), Some("test-bucket"));
+        assert_eq!(
+            context.bucket.as_ref().map(BucketName::as_str),
+            Some("test-bucket")
+        );
         let expected_key_hash = hex::encode(Sha256::digest(b"path/to/object.txt"));
         assert_eq!(
             context.key_sha256.as_deref(),
             Some(expected_key_hash.as_str())
         );
-        assert_eq!(context.upload_id.as_deref(), Some("upload-123"));
+        assert_eq!(context.upload_id, Some(upload_id));
         assert_eq!(
             context.part_number,
             Some(PartNumber::parse(7).expect("part number"))
@@ -473,7 +522,10 @@ mod tests {
 
         let context = request_log_context(&request, Some("s3.local"), "");
 
-        assert_eq!(context.bucket.as_deref(), Some("test-bucket"));
+        assert_eq!(
+            context.bucket.as_ref().map(BucketName::as_str),
+            Some("test-bucket")
+        );
         let expected_key_hash = hex::encode(Sha256::digest(b"key.txt"));
         assert_eq!(
             context.key_sha256.as_deref(),

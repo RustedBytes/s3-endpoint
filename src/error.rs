@@ -24,6 +24,26 @@ pub struct S3Error {
 }
 
 impl S3Error {
+    /// Returns the HTTP status that will be used for the error response.
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    /// Returns the S3 error code.
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
+    /// Returns the user-facing S3 error message.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Returns the optional S3 resource path included in the XML body.
+    pub fn resource(&self) -> Option<&str> {
+        self.resource.as_deref()
+    }
+
     /// Returns a `400 InvalidRequest` error.
     pub fn invalid_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "InvalidRequest", message)

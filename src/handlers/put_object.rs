@@ -38,7 +38,13 @@ pub(crate) async fn handle_put_object(
     validate_supported_request_body_length(&headers).map_err(|error| error.with_resource(path))?;
     validate_upload_headers(&headers)?;
     let auth_context = authenticate_request(&state, &request)?;
-    authorize_request(&state, &auth_context, &target.bucket, S3Action::PutObject)?;
+    authorize_request(
+        &state,
+        &auth_context,
+        &target.bucket,
+        Some(&target.key),
+        S3Action::PutObject,
+    )?;
 
     let upload_metadata = collect_upload_metadata(&headers)?;
     let _object_writer_permit = state.try_acquire_object_writer()?;

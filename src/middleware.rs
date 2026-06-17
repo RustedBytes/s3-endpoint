@@ -6,7 +6,13 @@
 //! media normalization that cannot safely operate as generic HTTP body
 //! middleware.
 
-use std::{collections::BTreeMap, fmt, path::Path, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    future::Future,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use futures_util::future::BoxFuture;
 use uuid::Uuid;
@@ -58,6 +64,85 @@ pub struct UploadProcessorRequest<'a> {
     pub replacement_path: &'a Path,
 }
 
+/// Owned convenience handle passed to closure-based upload processors.
+#[derive(Clone, Debug)]
+pub struct UploadProcessorHandle {
+    context: UploadProcessorContext,
+    current_path: PathBuf,
+    replacement_path: PathBuf,
+}
+
+impl UploadProcessorHandle {
+    fn from_request(request: UploadProcessorRequest<'_>) -> Self {
+        Self {
+            context: request.context.clone(),
+            current_path: request.current_path.to_path_buf(),
+            replacement_path: request.replacement_path.to_path_buf(),
+        }
+    }
+
+    /// Upload metadata and target identity.
+    pub fn context(&self) -> &UploadProcessorContext {
+        &self.context
+    }
+
+    /// Path to the current staged object bytes.
+    pub fn current_path(&self) -> &Path {
+        &self.current_path
+    }
+
+    /// Reserved path where replacement bytes may be written.
+    pub fn replacement_path(&self) -> &Path {
+        &self.replacement_path
+    }
+
+    /// Reads the current staged object into memory.
+    ///
+    /// This helper is intended for simple processors. Large-object processors
+    /// can stream directly from [`Self::current_path`].
+    pub async fn read_current(&self) -> Result<Vec<u8>, UploadProcessorError> {
+        tokio::fs::read(&self.current_path)
+            .await
+            .map_err(UploadProcessorError::from)
+    }
+
+    /// Writes replacement bytes to the reserved replacement path.
+    pub async fn write_replacement(
+        &self,
+        bytes: impl AsRef<[u8]>,
+    ) -> Result<(), UploadProcessorError> {
+        tokio::fs::write(&self.replacement_path, bytes)
+            .await
+            .map_err(UploadProcessorError::from)
+    }
+
+    /// Keeps the current staged bytes unchanged.
+    pub fn keep(&self) -> UploadProcessorAction {
+        UploadProcessorAction::Keep
+    }
+
+    /// Replaces current staged bytes with the file written to the replacement path.
+    pub fn replace(&self) -> UploadProcessorAction {
+        UploadProcessorAction::Replace
+    }
+
+    /// Rejects the upload with an S3 `AccessDenied` response.
+    pub fn reject(
+        &self,
+        message: impl Into<String>,
+    ) -> Result<UploadProcessorAction, UploadProcessorError> {
+        Err(UploadProcessorError::Rejected(message.into()))
+    }
+
+    /// Fails the upload with an S3 `InternalError` response.
+    pub fn fail(
+        &self,
+        message: impl Into<String>,
+    ) -> Result<UploadProcessorAction, UploadProcessorError> {
+        Err(UploadProcessorError::Failed(message.into()))
+    }
+}
+
 /// Processor decision for a staged upload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UploadProcessorAction {
@@ -94,6 +179,41 @@ pub trait UploadProcessor: Send + Sync + 'static {
         &'a self,
         request: UploadProcessorRequest<'a>,
     ) -> BoxFuture<'a, Result<UploadProcessorAction, UploadProcessorError>>;
+}
+
+/// Closure-backed upload processor adapter.
+pub struct UploadProcessorFn<F> {
+    name: String,
+    handler: F,
+}
+
+impl<F> UploadProcessorFn<F> {
+    /// Creates a closure-backed upload processor.
+    pub fn new(name: impl Into<String>, handler: F) -> Self {
+        Self {
+            name: name.into(),
+            handler,
+        }
+    }
+
+    /// Returns the diagnostic processor name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl<F, Fut> UploadProcessor for UploadProcessorFn<F>
+where
+    F: Fn(UploadProcessorHandle) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<UploadProcessorAction, UploadProcessorError>> + Send + 'static,
+{
+    fn process<'a>(
+        &'a self,
+        request: UploadProcessorRequest<'a>,
+    ) -> BoxFuture<'a, Result<UploadProcessorAction, UploadProcessorError>> {
+        let handle = UploadProcessorHandle::from_request(request);
+        Box::pin((self.handler)(handle))
+    }
 }
 
 pub(crate) async fn process_staged_upload(
@@ -159,6 +279,12 @@ async fn remove_unused_replacement(path: &Path) -> Result<(), S3Error> {
 
 impl From<StoreError> for UploadProcessorError {
     fn from(error: StoreError) -> Self {
+        Self::Failed(error.to_string())
+    }
+}
+
+impl From<std::io::Error> for UploadProcessorError {
+    fn from(error: std::io::Error) -> Self {
         Self::Failed(error.to_string())
     }
 }

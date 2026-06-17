@@ -22,7 +22,7 @@ pub(crate) async fn head_bucket(
 ) -> Result<Response, S3Error> {
     let auth_context = authenticate_request(&state, &request)?;
     let bucket = resolve_request_bucket(&state, &request)?;
-    authorize_request(&state, &auth_context, &bucket, S3Action::HeadBucket)?;
+    authorize_request(&state, &auth_context, &bucket, None, S3Action::HeadBucket)?;
     validate_empty_payload_hash(&request)?;
 
     Response::builder()

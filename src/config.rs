@@ -44,6 +44,62 @@ impl Config {
         self.upload_limits.validate()?;
         self.auth.validate()
     }
+
+    /// Creates a fluent configuration builder for a storage root.
+    pub fn builder(storage_root: impl Into<PathBuf>) -> ConfigBuilder {
+        ConfigBuilder {
+            config: Self::new(storage_root.into()),
+        }
+    }
+}
+
+/// Fluent builder for [`Config`].
+#[derive(Clone, Debug)]
+pub struct ConfigBuilder {
+    config: Config,
+}
+
+impl ConfigBuilder {
+    /// Replaces the authentication configuration.
+    pub fn auth(mut self, auth: AuthConfig) -> Self {
+        self.config.auth = auth;
+        self
+    }
+
+    /// Sets whether unsigned anonymous requests are accepted.
+    pub fn allow_anonymous(mut self, allow_anonymous: bool) -> Self {
+        self.config.auth.allow_anonymous = allow_anonymous;
+        self
+    }
+
+    /// Sets the SigV4 signing region.
+    pub fn region(mut self, region: impl Into<String>) -> Self {
+        self.config.auth.region = region.into();
+        self
+    }
+
+    /// Sets the optional virtual-hosted-style base domain.
+    pub fn virtual_host_base_domain(mut self, domain: impl Into<String>) -> Self {
+        self.config.virtual_host_base_domain = Some(domain.into());
+        self
+    }
+
+    /// Clears virtual-hosted-style addressing support.
+    pub fn without_virtual_host_base_domain(mut self) -> Self {
+        self.config.virtual_host_base_domain = None;
+        self
+    }
+
+    /// Replaces upload size and concurrency limits.
+    pub fn upload_limits(mut self, upload_limits: UploadLimits) -> Self {
+        self.config.upload_limits = upload_limits;
+        self
+    }
+
+    /// Returns the constructed configuration.
+    pub fn build(self) -> Config {
+        self.config
+    }
 }
 
 /// Upload size and concurrency limits.
@@ -82,6 +138,32 @@ impl Default for UploadLimits {
 }
 
 impl UploadLimits {
+    /// Creates a fluent upload-limit builder using production-oriented defaults.
+    pub fn builder() -> UploadLimitsBuilder {
+        UploadLimitsBuilder {
+            limits: Self::default_s3_compatible(),
+        }
+    }
+
+    /// Returns the default S3-compatible upload limits.
+    pub fn default_s3_compatible() -> Self {
+        Self::default()
+    }
+
+    /// Returns smaller limits intended for local development and tests.
+    pub fn local_development() -> Self {
+        const MIB: u64 = 1024 * 1024;
+        Self {
+            max_object_size: 1024 * MIB,
+            max_part_size: 512 * MIB,
+            min_non_final_part_size: 5 * MIB,
+            max_concurrent_s3_requests: 64,
+            max_active_object_writers: 16,
+            max_active_multipart_part_writers: 32,
+            max_active_aws_chunked_decoders: 16,
+        }
+    }
+
     /// Validates all upload limits.
     ///
     /// Returns an error when a limit is zero or when
@@ -130,6 +212,61 @@ impl UploadLimits {
                 "max_active_aws_chunked_decoders must be greater than 0",
             )?,
         })
+    }
+}
+
+/// Fluent builder for [`UploadLimits`].
+#[derive(Clone, Debug)]
+pub struct UploadLimitsBuilder {
+    limits: UploadLimits,
+}
+
+impl UploadLimitsBuilder {
+    /// Sets the maximum decoded object size in bytes.
+    pub fn max_object_size(mut self, value: u64) -> Self {
+        self.limits.max_object_size = value;
+        self
+    }
+
+    /// Sets the maximum decoded multipart part size in bytes.
+    pub fn max_part_size(mut self, value: u64) -> Self {
+        self.limits.max_part_size = value;
+        self
+    }
+
+    /// Sets the minimum size for each non-final multipart part in bytes.
+    pub fn min_non_final_part_size(mut self, value: u64) -> Self {
+        self.limits.min_non_final_part_size = value;
+        self
+    }
+
+    /// Sets the maximum number of concurrently admitted S3 requests.
+    pub fn max_concurrent_s3_requests(mut self, value: usize) -> Self {
+        self.limits.max_concurrent_s3_requests = value;
+        self
+    }
+
+    /// Sets the maximum number of active `PutObject` writers.
+    pub fn max_active_object_writers(mut self, value: usize) -> Self {
+        self.limits.max_active_object_writers = value;
+        self
+    }
+
+    /// Sets the maximum number of active multipart part writers.
+    pub fn max_active_multipart_part_writers(mut self, value: usize) -> Self {
+        self.limits.max_active_multipart_part_writers = value;
+        self
+    }
+
+    /// Sets the maximum number of active aws-chunked decoders.
+    pub fn max_active_aws_chunked_decoders(mut self, value: usize) -> Self {
+        self.limits.max_active_aws_chunked_decoders = value;
+        self
+    }
+
+    /// Returns the constructed upload limits.
+    pub fn build(self) -> UploadLimits {
+        self.limits
     }
 }
 
@@ -310,6 +447,13 @@ impl Default for AuthConfig {
 }
 
 impl AuthConfig {
+    /// Creates a fluent authentication configuration builder.
+    pub fn builder() -> AuthConfigBuilder {
+        AuthConfigBuilder {
+            config: Self::default(),
+        }
+    }
+
     /// Validates primary and additional credential configuration.
     ///
     /// Returns an error when credential strings are malformed, the region is
@@ -350,6 +494,127 @@ impl AuthConfig {
     pub fn permits(&self, bucket: &BucketName, action: S3Action) -> bool {
         (self.allowed_buckets.is_empty() || self.allowed_buckets.contains(bucket.as_str()))
             && (self.allowed_actions.is_empty() || self.allowed_actions.contains(&action))
+    }
+}
+
+/// Fluent builder for [`AuthConfig`].
+#[derive(Clone)]
+pub struct AuthConfigBuilder {
+    config: AuthConfig,
+}
+
+impl fmt::Debug for AuthConfigBuilder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthConfigBuilder")
+            .field("config", &self.config)
+            .finish()
+    }
+}
+
+impl AuthConfigBuilder {
+    /// Sets whether unsigned anonymous requests are accepted.
+    pub fn allow_anonymous(mut self, allow_anonymous: bool) -> Self {
+        self.config.allow_anonymous = allow_anonymous;
+        self
+    }
+
+    /// Sets the primary access key ID.
+    pub fn access_key_id(mut self, access_key_id: impl Into<String>) -> Self {
+        self.config.access_key_id = access_key_id.into();
+        self
+    }
+
+    /// Sets the primary secret key.
+    pub fn secret_key(mut self, secret_key: impl Into<String>) -> Self {
+        self.config.secret_key = secret_key.into();
+        self
+    }
+
+    /// Sets both primary credential fields.
+    pub fn primary_credentials(
+        mut self,
+        access_key_id: impl Into<String>,
+        secret_key: impl Into<String>,
+    ) -> Self {
+        self.config.access_key_id = access_key_id.into();
+        self.config.secret_key = secret_key.into();
+        self
+    }
+
+    /// Sets the optional primary session token.
+    pub fn session_token(mut self, session_token: impl Into<String>) -> Self {
+        self.config.session_token = Some(session_token.into());
+        self
+    }
+
+    /// Clears the primary session token.
+    pub fn without_session_token(mut self) -> Self {
+        self.config.session_token = None;
+        self
+    }
+
+    /// Sets the SigV4 signing region.
+    pub fn region(mut self, region: impl Into<String>) -> Self {
+        self.config.region = region.into();
+        self
+    }
+
+    /// Sets the maximum accepted SigV4 timestamp skew in seconds.
+    pub fn max_skew_seconds(mut self, seconds: i64) -> Self {
+        self.config.max_skew_seconds = seconds;
+        self
+    }
+
+    /// Replaces the global bucket allow-list.
+    pub fn allowed_buckets<I, S>(mut self, buckets: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.config.allowed_buckets = buckets.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Adds one bucket to the global allow-list.
+    pub fn allow_bucket(mut self, bucket: impl Into<String>) -> Self {
+        self.config.allowed_buckets.insert(bucket.into());
+        self
+    }
+
+    /// Replaces the global action allow-list.
+    pub fn allowed_actions<I>(mut self, actions: I) -> Self
+    where
+        I: IntoIterator<Item = S3Action>,
+    {
+        self.config.allowed_actions = actions.into_iter().collect();
+        self
+    }
+
+    /// Adds one action to the global allow-list.
+    pub fn allow_action(mut self, action: S3Action) -> Self {
+        self.config.allowed_actions.insert(action);
+        self
+    }
+
+    /// Replaces the additional credential entries.
+    pub fn credentials<I>(mut self, credentials: I) -> Self
+    where
+        I: IntoIterator<Item = AccessKeyConfig>,
+    {
+        self.config.credentials = credentials.into_iter().collect();
+        self
+    }
+
+    /// Adds one additional credential entry.
+    pub fn credential(mut self, credential: AccessKeyConfig) -> Self {
+        self.config.credentials.push(credential);
+        self
+    }
+
+    /// Returns the constructed authentication configuration.
+    pub fn build(self) -> AuthConfig {
+        self.config
     }
 }
 
@@ -510,6 +775,23 @@ impl fmt::Debug for AccessKeyConfig {
 }
 
 impl AccessKeyConfig {
+    /// Creates a fluent additional access-key builder.
+    pub fn builder(
+        access_key_id: impl Into<String>,
+        secret_key: impl Into<String>,
+    ) -> AccessKeyConfigBuilder {
+        AccessKeyConfigBuilder {
+            config: Self {
+                access_key_id: access_key_id.into(),
+                secret_key: secret_key.into(),
+                session_token: None,
+                active: true,
+                allowed_buckets: BTreeSet::new(),
+                allowed_actions: BTreeSet::new(),
+            },
+        }
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         validate_access_key_id(&self.access_key_id)?;
         validate_secret_key(&self.secret_key)?;
@@ -520,6 +802,77 @@ impl AccessKeyConfig {
             })?;
         }
         Ok(())
+    }
+}
+
+/// Fluent builder for [`AccessKeyConfig`].
+#[derive(Clone)]
+pub struct AccessKeyConfigBuilder {
+    config: AccessKeyConfig,
+}
+
+impl fmt::Debug for AccessKeyConfigBuilder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AccessKeyConfigBuilder")
+            .field("config", &self.config)
+            .finish()
+    }
+}
+
+impl AccessKeyConfigBuilder {
+    /// Sets the optional session token.
+    pub fn session_token(mut self, session_token: impl Into<String>) -> Self {
+        self.config.session_token = Some(session_token.into());
+        self
+    }
+
+    /// Clears the optional session token.
+    pub fn without_session_token(mut self) -> Self {
+        self.config.session_token = None;
+        self
+    }
+
+    /// Sets whether this credential can authenticate requests.
+    pub fn active(mut self, active: bool) -> Self {
+        self.config.active = active;
+        self
+    }
+
+    /// Replaces the bucket allow-list.
+    pub fn allowed_buckets<I, S>(mut self, buckets: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.config.allowed_buckets = buckets.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Adds one bucket to the allow-list.
+    pub fn allow_bucket(mut self, bucket: impl Into<String>) -> Self {
+        self.config.allowed_buckets.insert(bucket.into());
+        self
+    }
+
+    /// Replaces the action allow-list.
+    pub fn allowed_actions<I>(mut self, actions: I) -> Self
+    where
+        I: IntoIterator<Item = S3Action>,
+    {
+        self.config.allowed_actions = actions.into_iter().collect();
+        self
+    }
+
+    /// Adds one action to the allow-list.
+    pub fn allow_action(mut self, action: S3Action) -> Self {
+        self.config.allowed_actions.insert(action);
+        self
+    }
+
+    /// Returns the constructed access-key configuration.
+    pub fn build(self) -> AccessKeyConfig {
+        self.config
     }
 }
 
@@ -722,6 +1075,75 @@ mod tests {
     #[test]
     fn default_auth_config_is_valid() {
         AuthConfig::default().validate().expect("valid auth config");
+    }
+
+    #[test]
+    fn config_builder_sets_embedded_server_options() {
+        let limits = UploadLimits::builder()
+            .max_object_size(1024)
+            .max_part_size(512)
+            .min_non_final_part_size(128)
+            .max_concurrent_s3_requests(8)
+            .max_active_object_writers(2)
+            .max_active_multipart_part_writers(4)
+            .max_active_aws_chunked_decoders(3)
+            .build();
+        let auth = AuthConfig::builder()
+            .allow_anonymous(true)
+            .primary_credentials("client", "secret")
+            .session_token("token")
+            .region("eu-west-1")
+            .max_skew_seconds(60)
+            .allow_bucket("media")
+            .allow_action(S3Action::PutObject)
+            .credential(
+                AccessKeyConfig::builder("extra", "extra-secret")
+                    .allow_bucket("archive")
+                    .allow_action(S3Action::GetObject)
+                    .build(),
+            )
+            .build();
+
+        let config = Config::builder("/tmp/s3-data")
+            .auth(auth)
+            .virtual_host_base_domain("s3.test")
+            .upload_limits(limits)
+            .build();
+
+        assert_eq!(config.storage_root, PathBuf::from("/tmp/s3-data"));
+        assert_eq!(config.virtual_host_base_domain.as_deref(), Some("s3.test"));
+        assert!(config.auth.allow_anonymous);
+        assert_eq!(config.auth.access_key_id, "client");
+        assert_eq!(config.auth.secret_key, "secret");
+        assert_eq!(config.auth.session_token.as_deref(), Some("token"));
+        assert_eq!(config.auth.region, "eu-west-1");
+        assert_eq!(config.auth.max_skew_seconds, 60);
+        assert!(config.auth.allowed_buckets.contains("media"));
+        assert!(config.auth.allowed_actions.contains(&S3Action::PutObject));
+        assert_eq!(config.auth.credentials.len(), 1);
+        assert_eq!(config.auth.credentials[0].access_key_id, "extra");
+        assert!(
+            config.auth.credentials[0]
+                .allowed_buckets
+                .contains("archive")
+        );
+        assert_eq!(config.upload_limits.max_object_size, 1024);
+        assert_eq!(config.upload_limits.max_part_size, 512);
+        assert_eq!(config.upload_limits.min_non_final_part_size, 128);
+        assert_eq!(config.upload_limits.max_concurrent_s3_requests, 8);
+        assert_eq!(config.upload_limits.max_active_object_writers, 2);
+        assert_eq!(config.upload_limits.max_active_multipart_part_writers, 4);
+        assert_eq!(config.upload_limits.max_active_aws_chunked_decoders, 3);
+    }
+
+    #[test]
+    fn upload_limit_presets_are_valid() {
+        UploadLimits::default_s3_compatible()
+            .validate()
+            .expect("default limits");
+        UploadLimits::local_development()
+            .validate()
+            .expect("local development limits");
     }
 
     #[test]

@@ -8,10 +8,11 @@ Processors run after request authentication, payload decoding, upload size
 checks, and client checksum validation. They run before the object is committed
 to storage.
 
-## Register Processors
+## Embed The Router
 
-Build `AppState` with `AppState::builder(config)` and register processors in the
-order they should run.
+Use the fluent config builders when embedding the endpoint in an Axum server.
+`AppBuilder::build_router()` builds `AppState` and returns a ready-to-serve
+router.
 
 ```rust
 use std::net::SocketAddr;
@@ -19,38 +20,66 @@ use std::net::SocketAddr;
 use s3_endpoint::{
     AppState,
     config::{AuthConfig, Config},
-    router,
+    error::S3Error,
 };
 use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = Config {
-        storage_root: "./data".into(),
-        auth: AuthConfig {
-            allow_anonymous: true,
-            ..AuthConfig::default()
-        },
-        virtual_host_base_domain: None,
-        upload_limits: Default::default(),
-    };
+    let config = Config::builder("./data")
+        .auth(
+            AuthConfig::builder()
+                .allow_anonymous(true)
+                .region("us-east-1")
+                .build(),
+        )
+        .build();
 
-    let state = AppState::builder(config)
-        .upload_processor(AntivirusProcessor)
-        .upload_processor(AudioCleanerProcessor)
-        .build()
+    let app = AppState::builder(config)
+        .health_path("/ready")
+        .upload_processor_fn("antivirus", |upload| async move {
+            let bytes = upload.read_current().await?;
+            if bytes.windows(b"EICAR".len()).any(|window| window == b"EICAR") {
+                return upload.reject("upload failed antivirus scan");
+            }
+            Ok(upload.keep())
+        })
+        .authorization_policy(|request| {
+            if request.bucket.as_str() == "blocked-bucket" {
+                return Err(S3Error::access_denied("bucket is blocked by application policy"));
+            }
+            Ok(())
+        })
+        .on_error(|context, error| async move {
+            tracing::warn!(
+                request_id = %context.request_id,
+                operation = %context.operation,
+                code = %error.code(),
+                message = %error.message(),
+                "S3 request failed"
+            );
+            error
+        })
+        .build_router()
         .await?;
 
     let addr: SocketAddr = "127.0.0.1:9000".parse()?;
     let listener = TcpListener::bind(addr).await?;
-    axum::serve(listener, router(state)).await?;
+    axum::serve(listener, app).await?;
 
     Ok(())
 }
 ```
 
-`AppState::new(config)` still works and creates a server with no upload
-processors.
+`AppState::new(config)` and `router(state)` still work and create a server with
+the default `/health` route and no upload processors.
+
+## Register Processors
+
+Register processors in the order they should run. For simple processors, prefer
+`upload_processor_fn`. The closure receives an owned handle with helpers for
+reading the staged file, writing a replacement, keeping bytes unchanged,
+rejecting the upload, or failing the request.
 
 ## Inspect And Reject Uploads
 
@@ -59,34 +88,16 @@ Return `UploadProcessorError::Rejected` to reject the upload with an S3
 `AccessDenied` response.
 
 ```rust
-use futures_util::future::BoxFuture;
-use s3_endpoint::middleware::{
-    UploadProcessor, UploadProcessorAction, UploadProcessorError,
-    UploadProcessorRequest,
-};
-
-struct AntivirusProcessor;
-
-impl UploadProcessor for AntivirusProcessor {
-    fn process<'a>(
-        &'a self,
-        request: UploadProcessorRequest<'a>,
-    ) -> BoxFuture<'a, Result<UploadProcessorAction, UploadProcessorError>> {
-        Box::pin(async move {
-            let bytes = tokio::fs::read(request.current_path)
-                .await
-                .map_err(|error| UploadProcessorError::Failed(error.to_string()))?;
-
-            if bytes.windows(b"EICAR".len()).any(|window| window == b"EICAR") {
-                return Err(UploadProcessorError::Rejected(
-                    "upload failed antivirus scan".to_owned(),
-                ));
-            }
-
-            Ok(UploadProcessorAction::Keep)
-        })
-    }
-}
+let state = AppState::builder(config)
+    .upload_processor_fn("antivirus", |upload| async move {
+        let bytes = upload.read_current().await?;
+        if bytes.windows(b"EICAR".len()).any(|window| window == b"EICAR") {
+            return upload.reject("upload failed antivirus scan");
+        }
+        Ok(upload.keep())
+    })
+    .build()
+    .await?;
 ```
 
 ## Transform Uploads
@@ -139,6 +150,9 @@ fn normalize_audio_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, UploadProcessorError
 }
 ```
 
+The trait form remains useful for reusable processor types and processors that
+want direct streaming access to staged file paths.
+
 ## Behavior Notes
 
 - Processors are trusted in-process Rust code.
@@ -152,4 +166,3 @@ fn normalize_audio_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, UploadProcessorError
   `InternalError`.
 - Processor rejections use `UploadProcessorError::Rejected` and return S3
   `AccessDenied`.
-

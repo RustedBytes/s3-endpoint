@@ -14,6 +14,8 @@ pub mod config;
 /// S3 XML error construction and HTTP response conversion.
 pub mod error;
 pub(crate) mod handlers;
+/// Developer tuning hooks for embedded applications.
+pub mod hooks;
 pub(crate) mod http;
 /// S3-aware upload middleware extension points.
 pub mod middleware;
@@ -22,13 +24,28 @@ pub mod s3;
 /// Filesystem-backed object and multipart storage types.
 pub mod storage;
 
-use std::sync::Arc;
+use std::{convert::Infallible, future::Future, sync::Arc};
 
-use axum::{Router, http::HeaderMap};
-use middleware::{SharedUploadProcessor, UploadProcessor};
+use axum::{
+    Router,
+    body::Body,
+    http::{HeaderMap, Request},
+    response::IntoResponse,
+    routing::Route,
+};
+use hooks::{
+    AuthorizationContext, AuthorizationPolicy, ErrorMapper, RequestIdFactory, RequestObserver,
+    S3ErrorContext, S3RequestContext, SharedAuthorizationPolicy, SharedErrorMapper,
+    SharedRequestIdFactory, SharedRequestObserver,
+};
+use middleware::{
+    SharedUploadProcessor, UploadProcessor, UploadProcessorAction, UploadProcessorError,
+    UploadProcessorFn, UploadProcessorHandle,
+};
 use storage::{FileMultipartStore, FileObjectStore};
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tower::{Layer, Service};
 
 #[derive(Clone)]
 /// Shared application state for the S3 endpoint.
@@ -47,6 +64,10 @@ pub struct AppState {
     /// Filesystem-backed multipart upload store.
     pub multipart_store: Arc<FileMultipartStore>,
     pub(crate) upload_processors: Arc<Vec<SharedUploadProcessor>>,
+    request_observer: Option<SharedRequestObserver>,
+    error_mapper: Option<SharedErrorMapper>,
+    request_id_factory: SharedRequestIdFactory,
+    authorization_policy: Option<SharedAuthorizationPolicy>,
     admission: Arc<AdmissionControl>,
 }
 
@@ -56,6 +77,12 @@ impl AppState {
         AppBuilder {
             config,
             upload_processors: Vec::new(),
+            request_observer: None,
+            error_mapper: None,
+            request_id_factory: Arc::new(s3::types::RequestId::new),
+            authorization_policy: None,
+            health_path: Some("/health".to_owned()),
+            router_layers: Vec::new(),
         }
     }
 
@@ -73,6 +100,12 @@ impl AppState {
         let AppBuilder {
             config,
             upload_processors,
+            request_observer,
+            error_mapper,
+            request_id_factory,
+            authorization_policy,
+            health_path: _,
+            router_layers: _,
         } = builder;
         config.validate()?;
         let upload_limits = config.upload_limits.validated()?;
@@ -85,12 +118,49 @@ impl AppState {
             object_store,
             multipart_store,
             upload_processors: Arc::new(upload_processors),
+            request_observer,
+            error_mapper,
+            request_id_factory,
+            authorization_policy,
             admission: Arc::new(AdmissionControl::new(&upload_limits)),
         })
     }
 
     pub(crate) fn upload_processors(&self) -> &[SharedUploadProcessor] {
         &self.upload_processors
+    }
+
+    pub(crate) fn request_id(&self) -> s3::types::RequestId {
+        self.request_id_factory.request_id()
+    }
+
+    pub(crate) async fn observe_request(&self, context: S3RequestContext) {
+        if let Some(observer) = &self.request_observer {
+            observer.observe(context).await;
+        }
+    }
+
+    pub(crate) async fn map_error(
+        &self,
+        context: S3ErrorContext,
+        error: error::S3Error,
+    ) -> error::S3Error {
+        if let Some(mapper) = &self.error_mapper {
+            mapper.map_error(context, error).await
+        } else {
+            error
+        }
+    }
+
+    pub(crate) fn authorize_with_policy(
+        &self,
+        context: AuthorizationContext,
+    ) -> Result<(), error::S3Error> {
+        if let Some(policy) = &self.authorization_policy {
+            policy.authorize(context)
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn try_acquire_s3_request(&self) -> Result<OwnedSemaphorePermit, error::S3Error> {
@@ -149,7 +219,15 @@ impl AppState {
 pub struct AppBuilder {
     config: config::Config,
     upload_processors: Vec<SharedUploadProcessor>,
+    request_observer: Option<SharedRequestObserver>,
+    error_mapper: Option<SharedErrorMapper>,
+    request_id_factory: SharedRequestIdFactory,
+    authorization_policy: Option<SharedAuthorizationPolicy>,
+    health_path: Option<String>,
+    router_layers: Vec<RouterTransform>,
 }
+
+type RouterTransform = Arc<dyn Fn(Router) -> Router + Send + Sync>;
 
 impl AppBuilder {
     /// Registers an upload processor.
@@ -164,9 +242,111 @@ impl AppBuilder {
         self
     }
 
+    /// Registers a closure-backed upload processor.
+    ///
+    /// The closure receives an owned [`UploadProcessorHandle`] so common async
+    /// closures do not need to name [`futures_util::future::BoxFuture`].
+    pub fn upload_processor_fn<F, Fut>(mut self, name: impl Into<String>, handler: F) -> Self
+    where
+        F: Fn(UploadProcessorHandle) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<UploadProcessorAction, UploadProcessorError>> + Send + 'static,
+    {
+        self.upload_processors
+            .push(Arc::new(UploadProcessorFn::new(name, handler)));
+        self
+    }
+
+    /// Sets the health-check route path used by [`Self::build_router`].
+    pub fn health_path(mut self, path: impl Into<String>) -> Self {
+        self.health_path = Some(path.into());
+        self
+    }
+
+    /// Disables the health-check route used by [`Self::build_router`].
+    pub fn disable_health_route(mut self) -> Self {
+        self.health_path = None;
+        self
+    }
+
+    /// Applies a Tower layer to routers built by [`Self::build_router`].
+    pub fn router_layer<L>(mut self, layer: L) -> Self
+    where
+        L: Layer<Route> + Clone + Send + Sync + 'static,
+        L::Service: Service<Request<Body>> + Clone + Send + Sync + 'static,
+        <L::Service as Service<Request<Body>>>::Response: IntoResponse + 'static,
+        <L::Service as Service<Request<Body>>>::Error: Into<Infallible> + 'static,
+        <L::Service as Service<Request<Body>>>::Future: Send + 'static,
+    {
+        self.router_layers
+            .push(Arc::new(move |router| router.layer(layer.clone())));
+        self
+    }
+
+    /// Registers a read-only request observer.
+    pub fn on_request<O>(mut self, observer: O) -> Self
+    where
+        O: RequestObserver,
+    {
+        self.request_observer = Some(Arc::new(observer));
+        self
+    }
+
+    /// Registers an S3 error mapper.
+    pub fn on_error<M>(mut self, mapper: M) -> Self
+    where
+        M: ErrorMapper,
+    {
+        self.error_mapper = Some(Arc::new(mapper));
+        self
+    }
+
+    /// Sets the request ID factory used for S3 responses and hooks.
+    pub fn request_id_factory<F>(mut self, factory: F) -> Self
+    where
+        F: RequestIdFactory,
+    {
+        self.request_id_factory = Arc::new(factory);
+        self
+    }
+
+    /// Registers an additional authorization policy.
+    pub fn authorization_policy<P>(mut self, policy: P) -> Self
+    where
+        P: AuthorizationPolicy,
+    {
+        self.authorization_policy = Some(Arc::new(policy));
+        self
+    }
+
     /// Builds application state.
     pub async fn build(self) -> Result<AppState, AppInitError> {
         AppState::from_builder(self).await
+    }
+
+    /// Builds application state and returns an Axum router.
+    pub async fn build_router(self) -> Result<Router, AppInitError> {
+        let health_path = self.health_path.clone();
+        let router_layers = self.router_layers.clone();
+        validate_health_path(health_path.as_deref())?;
+        let state = AppState::from_builder(self).await?;
+        let mut router = http::router_with_options(state, http::RouterOptions { health_path });
+        for layer in router_layers {
+            router = layer(router);
+        }
+        Ok(router)
+    }
+}
+
+fn validate_health_path(path: Option<&str>) -> Result<(), AppInitError> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    if path.starts_with('/') && path.len() > 1 && !path.contains('*') {
+        Ok(())
+    } else {
+        Err(AppInitError::RouterConfig(
+            "health path must start with '/' and must not contain wildcards".to_owned(),
+        ))
     }
 }
 
@@ -202,6 +382,10 @@ pub enum AppInitError {
     /// Storage initialization or cleanup failed.
     #[error("failed to initialize storage")]
     Store(#[from] storage::StoreError),
+
+    /// Router tuning configuration is invalid.
+    #[error("invalid router configuration: {0}")]
+    RouterConfig(String),
 }
 
 /// Builds the Axum router for the S3 endpoint.
@@ -216,10 +400,11 @@ pub fn router(state: AppState) -> Router {
 mod tests {
     use super::*;
     use axum::{
-        body::Body,
-        http::{HeaderMap, HeaderValue, Request, StatusCode},
+        body::{Body, to_bytes},
+        http::{HeaderMap, HeaderValue, Request, StatusCode, header},
     };
     use futures_util::future::BoxFuture;
+    use std::sync::Mutex;
     use tower::ServiceExt;
 
     #[tokio::test]
@@ -266,6 +451,250 @@ mod tests {
         .expect("create app state");
 
         assert_eq!(state.upload_processors.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn app_state_builder_registers_upload_processor_fn() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let state = AppState::builder(config::Config::new(temp_dir.path().to_path_buf()))
+            .upload_processor_fn("keep", |upload| async move { Ok(upload.keep()) })
+            .build()
+            .await
+            .expect("create app state");
+
+        assert_eq!(state.upload_processors.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn build_router_serves_custom_health_path_and_s3_routes() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let app = AppState::builder(
+            config::Config::builder(temp_dir.path())
+                .allow_anonymous(true)
+                .build(),
+        )
+        .health_path("/ready")
+        .build_router()
+        .await
+        .expect("router");
+
+        let health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("health response");
+        assert_eq!(health.status(), StatusCode::NO_CONTENT);
+
+        let head_bucket = app
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/test-bucket")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("head bucket response");
+        assert_eq!(head_bucket.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn build_router_can_disable_health_route() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let app = AppState::builder(
+            config::Config::builder(temp_dir.path())
+                .allow_anonymous(true)
+                .build(),
+        )
+        .disable_health_route()
+        .build_router()
+        .await
+        .expect("router");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_ne!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn authorization_policy_can_deny_allowed_request() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let app = AppState::builder(
+            config::Config::builder(temp_dir.path())
+                .allow_anonymous(true)
+                .build(),
+        )
+        .authorization_policy(|context: hooks::AuthorizationContext| {
+            assert_eq!(context.bucket.as_str(), "test-bucket");
+            assert_eq!(
+                context.key.as_ref().map(|key| key.as_str()),
+                Some("blocked.txt")
+            );
+            Err(error::S3Error::access_denied("blocked by policy"))
+        })
+        .build_router()
+        .await
+        .expect("router");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/test-bucket/blocked.txt")
+                    .header(header::CONTENT_LENGTH, "2")
+                    .body(Body::from("hi"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn error_mapper_can_rewrite_error_and_preserve_request_id() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let app = AppState::builder(
+            config::Config::builder(temp_dir.path())
+                .allow_anonymous(true)
+                .build(),
+        )
+        .request_id_factory(|| s3::types::RequestId::parse("fixed-request-id").expect("request id"))
+        .on_error(|context: hooks::S3ErrorContext, _error| async move {
+            assert_eq!(context.request_id.as_str(), "fixed-request-id");
+            error::S3Error::access_denied("mapped error")
+        })
+        .build_router()
+        .await
+        .expect("router");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/test-bucket/missing.txt")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-amz-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("fixed-request-id")
+        );
+    }
+
+    #[tokio::test]
+    async fn request_observer_receives_parsed_request_context() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_clone = Arc::clone(&observed);
+        let app = AppState::builder(
+            config::Config::builder(temp_dir.path())
+                .allow_anonymous(true)
+                .build(),
+        )
+        .request_id_factory(|| s3::types::RequestId::parse("observed-request").expect("request id"))
+        .on_request(move |context: hooks::S3RequestContext| {
+            let observed = Arc::clone(&observed_clone);
+            async move {
+                observed.lock().expect("observed lock").push(context);
+            }
+        })
+        .build_router()
+        .await
+        .expect("router");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/test-bucket")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let observed = observed.lock().expect("observed lock");
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].request_id.as_str(), "observed-request");
+        assert_eq!(observed[0].operation, "HeadBucket");
+        assert_eq!(
+            observed[0].bucket.as_ref().map(|bucket| bucket.as_str()),
+            Some("test-bucket")
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_processor_fn_can_transform_stored_object() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let app = AppState::builder(
+            config::Config::builder(temp_dir.path())
+                .allow_anonymous(true)
+                .build(),
+        )
+        .upload_processor_fn("uppercase", |upload| async move {
+            let bytes = upload.read_current().await?;
+            let upper = bytes
+                .into_iter()
+                .map(|byte| byte.to_ascii_uppercase())
+                .collect::<Vec<_>>();
+            upload.write_replacement(upper).await?;
+            Ok(upload.replace())
+        })
+        .build_router()
+        .await
+        .expect("router");
+
+        let put = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/test-bucket/greeting.txt")
+                    .header(header::CONTENT_LENGTH, "5")
+                    .body(Body::from("hello"))
+                    .expect("request"),
+            )
+            .await
+            .expect("put response");
+        assert_eq!(put.status(), StatusCode::OK);
+
+        let get = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/test-bucket/greeting.txt")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("get response");
+        assert_eq!(get.status(), StatusCode::OK);
+        let body = to_bytes(get.into_body(), 1024).await.expect("body");
+        assert_eq!(&body[..], b"HELLO");
     }
 
     #[tokio::test]
