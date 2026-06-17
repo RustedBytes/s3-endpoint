@@ -40,6 +40,7 @@ pub(crate) async fn create_multipart_upload(
     validate_upload_headers(request.headers())?;
     validate_empty_payload_hash(&request)?;
     let target = resolve_request_target(&state, &request)?;
+    let key_sha256 = crate::handlers::s3::object_key_sha256(&target.key);
     authorize_request(
         &state,
         &auth_context,
@@ -64,6 +65,13 @@ pub(crate) async fn create_multipart_upload(
         )
         .await
         .map_err(map_store_error)?;
+    log::info!(
+        "multipart upload created request_id={} bucket={} key_sha256={} upload_id={}",
+        request_id,
+        session.bucket.as_str(),
+        key_sha256,
+        session.upload_id.as_str()
+    );
     let body = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n\
@@ -91,6 +99,7 @@ pub(crate) async fn upload_part(
     validate_upload_headers(request.headers())?;
     let headers = request.headers().clone();
     let session = validate_upload_session_target(&state, &request, &auth_context, &upload_id)?;
+    let key_sha256 = crate::handlers::s3::object_key_sha256(&session.key);
     authorize_request(
         &state,
         &auth_context,
@@ -155,6 +164,16 @@ pub(crate) async fn upload_part(
         )
         .await
         .map_err(map_store_error)?;
+    log::info!(
+        "multipart part committed request_id={} bucket={} key_sha256={} upload_id={} part_number={} size={} etag={}",
+        request_id,
+        session.bucket.as_str(),
+        key_sha256,
+        upload_id.as_str(),
+        part_number.get(),
+        uploaded_size,
+        etag.as_str()
+    );
 
     let mut response = Response::builder()
         .status(StatusCode::OK)
@@ -279,6 +298,7 @@ pub(crate) async fn abort_multipart_upload(
 ) -> Result<Response, S3Error> {
     validate_empty_request_body_headers(request.headers(), "AbortMultipartUpload")?;
     let session = validate_upload_session_target(&state, &request, &auth_context, &upload_id)?;
+    let key_sha256 = crate::handlers::s3::object_key_sha256(&session.key);
     authorize_request(
         &state,
         &auth_context,
@@ -292,6 +312,13 @@ pub(crate) async fn abort_multipart_upload(
         .abort_upload(&upload_id)
         .await
         .map_err(map_store_error)?;
+    log::info!(
+        "multipart upload aborted request_id={} bucket={} key_sha256={} upload_id={}",
+        request_id,
+        session.bucket.as_str(),
+        key_sha256,
+        upload_id.as_str()
+    );
 
     Response::builder()
         .status(StatusCode::NO_CONTENT)
@@ -311,6 +338,7 @@ pub(crate) async fn complete_multipart_upload(
     let headers = request.headers().clone();
     let location = completion_location(&request);
     let session = validate_upload_session_target(&state, &request, &auth_context, &upload_id)?;
+    let key_sha256 = crate::handlers::s3::object_key_sha256(&session.key);
     authorize_request(
         &state,
         &auth_context,
@@ -350,6 +378,16 @@ pub(crate) async fn complete_multipart_upload(
         })
         .await
         .map_err(map_store_error)?;
+    log::info!(
+        "multipart upload completed request_id={} bucket={} key_sha256={} upload_id={} parts={} size={} etag={}",
+        request_id,
+        metadata.bucket.as_str(),
+        key_sha256,
+        upload_id.as_str(),
+        parts.len(),
+        metadata.size,
+        metadata.etag.as_str()
+    );
 
     let body = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\

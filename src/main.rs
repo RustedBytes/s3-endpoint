@@ -89,13 +89,53 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let subscriber = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)?;
 
     let cli = Cli::parse();
     let default_limits = UploadLimits::default();
     let credentials = load_credentials_file(cli.credentials_file.as_deref()).await?;
+    let storage_root = cli.storage_root.clone();
+    let region = cli.region.clone();
+    let upload_limits = UploadLimits {
+        max_object_size: cli
+            .max_object_size
+            .unwrap_or(default_limits.max_object_size),
+        max_part_size: cli.max_part_size.unwrap_or(default_limits.max_part_size),
+        min_non_final_part_size: cli
+            .min_non_final_part_size
+            .unwrap_or(default_limits.min_non_final_part_size),
+        max_concurrent_s3_requests: cli
+            .max_concurrent_s3_requests
+            .unwrap_or(default_limits.max_concurrent_s3_requests),
+        max_active_object_writers: cli
+            .max_active_object_writers
+            .unwrap_or(default_limits.max_active_object_writers),
+        max_active_multipart_part_writers: cli
+            .max_active_multipart_part_writers
+            .unwrap_or(default_limits.max_active_multipart_part_writers),
+        max_active_aws_chunked_decoders: cli
+            .max_active_aws_chunked_decoders
+            .unwrap_or(default_limits.max_active_aws_chunked_decoders),
+    };
+    log::info!(
+        "starting s3-endpoint addr={} storage_root={} allow_anonymous={} region={} max_object_size={} max_part_size={} min_non_final_part_size={} max_concurrent_s3_requests={} max_active_object_writers={} max_active_multipart_part_writers={} max_active_aws_chunked_decoders={} extra_credentials={}",
+        cli.addr,
+        storage_root.display(),
+        cli.allow_anonymous,
+        region,
+        upload_limits.max_object_size,
+        upload_limits.max_part_size,
+        upload_limits.min_non_final_part_size,
+        upload_limits.max_concurrent_s3_requests,
+        upload_limits.max_active_object_writers,
+        upload_limits.max_active_multipart_part_writers,
+        upload_limits.max_active_aws_chunked_decoders,
+        credentials.len()
+    );
     let state = AppState::new(Config {
         storage_root: cli.storage_root,
         auth: s3_endpoint::config::AuthConfig {
@@ -110,31 +150,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             credentials,
         },
         virtual_host_base_domain: cli.virtual_host_base_domain,
-        upload_limits: UploadLimits {
-            max_object_size: cli
-                .max_object_size
-                .unwrap_or(default_limits.max_object_size),
-            max_part_size: cli.max_part_size.unwrap_or(default_limits.max_part_size),
-            min_non_final_part_size: cli
-                .min_non_final_part_size
-                .unwrap_or(default_limits.min_non_final_part_size),
-            max_concurrent_s3_requests: cli
-                .max_concurrent_s3_requests
-                .unwrap_or(default_limits.max_concurrent_s3_requests),
-            max_active_object_writers: cli
-                .max_active_object_writers
-                .unwrap_or(default_limits.max_active_object_writers),
-            max_active_multipart_part_writers: cli
-                .max_active_multipart_part_writers
-                .unwrap_or(default_limits.max_active_multipart_part_writers),
-            max_active_aws_chunked_decoders: cli
-                .max_active_aws_chunked_decoders
-                .unwrap_or(default_limits.max_active_aws_chunked_decoders),
-        },
+        upload_limits,
     })
     .await?;
 
     let listener = TcpListener::bind(cli.addr).await?;
+    log::info!("s3-endpoint listening addr={}", cli.addr);
     tracing::info!(addr = %cli.addr, "listening");
     axum::serve(listener, router(state)).await?;
     Ok(())
@@ -151,8 +172,35 @@ async fn load_credentials_file(
         return Ok(Vec::new());
     };
 
-    let json = tokio::fs::read_to_string(path).await?;
-    parse_credentials_json(&json).map_err(|err| err.into())
+    log::info!("loading additional credentials path={}", path.display());
+    let json = match tokio::fs::read_to_string(path).await {
+        Ok(json) => json,
+        Err(error) => {
+            log::warn!(
+                "failed to read additional credentials path={} error={}",
+                path.display(),
+                error
+            );
+            return Err(error.into());
+        }
+    };
+    let credentials = match parse_credentials_json(&json) {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            log::warn!(
+                "failed to parse additional credentials path={} error={}",
+                path.display(),
+                error
+            );
+            return Err(error.into());
+        }
+    };
+    log::info!(
+        "loaded additional credentials path={} count={}",
+        path.display(),
+        credentials.len()
+    );
+    Ok(credentials)
 }
 
 fn parse_credentials_json(json: &str) -> Result<Vec<AccessKeyConfig>, String> {

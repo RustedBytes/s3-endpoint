@@ -19,6 +19,7 @@ pub(crate) async fn delete_object(
     auth_context: auth::AuthContext,
 ) -> Result<Response, S3Error> {
     let target = resolve_request_target(&state, &request)?;
+    let key_sha256 = crate::handlers::s3::object_key_sha256(&target.key);
     authorize_request(
         &state,
         &auth_context,
@@ -33,6 +34,12 @@ pub(crate) async fn delete_object(
         .delete_object(&target.bucket, &target.key)
         .await
         .map_err(|err| S3Error::internal(format!("failed to delete object: {err}")))?;
+    log::info!(
+        "object deleted request_id={} bucket={} key_sha256={}",
+        request_id,
+        target.bucket.as_str(),
+        key_sha256
+    );
 
     Response::builder()
         .status(StatusCode::NO_CONTENT)

@@ -35,6 +35,7 @@ pub(crate) async fn handle_put_object(
 ) -> Result<Response, S3Error> {
     let path = request.uri().path().to_owned();
     let target = resolve_request_target(&state, &request)?;
+    let key_sha256 = crate::handlers::s3::object_key_sha256(&target.key);
 
     let headers = request.headers().clone();
     validate_supported_request_body_length(&headers).map_err(|error| error.with_resource(path))?;
@@ -63,6 +64,12 @@ pub(crate) async fn handle_put_object(
         .create_temp_object(&target.bucket, &target.key)
         .await
         .map_err(|err| S3Error::internal(format!("failed to create temporary object: {err}")))?;
+    log::info!(
+        "object upload staged request_id={} bucket={} key_sha256={}",
+        request_id,
+        target.bucket.as_str(),
+        key_sha256
+    );
 
     let uploaded_body = match write_upload_body(
         &headers,
@@ -149,6 +156,14 @@ pub(crate) async fn handle_put_object(
         .commit_staged_object(staged, metadata)
         .await
         .map_err(|err| S3Error::internal(format!("failed to commit object: {err}")))?;
+    log::info!(
+        "object upload committed request_id={} bucket={} key_sha256={} size={} etag={}",
+        request_id,
+        target.bucket.as_str(),
+        key_sha256,
+        final_body.size.get(),
+        etag.as_str()
+    );
 
     let mut response = Response::builder()
         .status(StatusCode::OK)

@@ -43,6 +43,28 @@ pub async fn handle_s3_request(State(state): State<AppState>, request: Request<B
         .and_then(|value| value.parse::<u64>().ok());
     let request_id = state.request_id();
     let started_at = Instant::now();
+    log::info!(
+        "s3 request started request_id={} method={} operation={} bucket={} key_sha256={} upload_id={} part_number={} request_content_length={}",
+        request_id,
+        method,
+        operation,
+        log_context
+            .bucket
+            .as_ref()
+            .map(BucketName::as_str)
+            .unwrap_or(""),
+        log_context.key_sha256.as_deref().unwrap_or(""),
+        log_context
+            .upload_id
+            .as_ref()
+            .map(UploadId::as_str)
+            .unwrap_or(""),
+        log_context
+            .part_number
+            .map(PartNumber::get)
+            .unwrap_or_default(),
+        content_length.unwrap_or_default()
+    );
     state
         .observe_request(S3RequestContext {
             request_id: request_id.clone(),
@@ -106,6 +128,30 @@ pub async fn handle_s3_request(State(state): State<AppState>, request: Request<B
         request_content_length = content_length.unwrap_or_default(),
         decoded_bytes = log_context.decoded_bytes.unwrap_or_default(),
         "s3 request completed"
+    );
+    log::info!(
+        "s3 request completed request_id={} operation={} status={} duration_ms={} bucket={} key_sha256={} upload_id={} part_number={} request_content_length={} decoded_bytes={}",
+        request_id,
+        operation,
+        response.status().as_u16(),
+        started_at.elapsed().as_millis(),
+        log_context
+            .bucket
+            .as_ref()
+            .map(BucketName::as_str)
+            .unwrap_or(""),
+        log_context.key_sha256.as_deref().unwrap_or(""),
+        log_context
+            .upload_id
+            .as_ref()
+            .map(UploadId::as_str)
+            .unwrap_or(""),
+        log_context
+            .part_number
+            .map(PartNumber::get)
+            .unwrap_or_default(),
+        content_length.unwrap_or_default(),
+        log_context.decoded_bytes.unwrap_or_default()
     );
     response
 }
@@ -171,6 +217,10 @@ pub(crate) fn record_decoded_body_bytes(mut response: Response, bytes: u64) -> R
     response
 }
 
+pub(crate) fn object_key_sha256(key: &ObjectKey) -> String {
+    hex::encode(Sha256::digest(key.as_str().as_bytes()))
+}
+
 fn request_log_context(
     request: &Request<Body>,
     virtual_host_base_domain: Option<&str>,
@@ -190,7 +240,7 @@ fn request_log_context(
     if let Ok(target) = resolve_s3_target(request.uri().path(), host, virtual_host_base_domain) {
         context.bucket = Some(target.bucket);
         context.key = Some(target.key.clone());
-        context.key_sha256 = Some(hex::encode(Sha256::digest(target.key.as_str().as_bytes())));
+        context.key_sha256 = Some(object_key_sha256(&target.key));
     } else if let Ok(bucket) =
         resolve_bucket_name(request.uri().path(), host, virtual_host_base_domain)
     {
@@ -215,7 +265,28 @@ async fn dispatch(
                 action: operation.action(),
                 operation: operation.clone(),
             })?;
-            let auth_context = authenticate_request(&state, &request).await?;
+            let auth_context = match authenticate_request(&state, &request).await {
+                Ok(auth_context) => {
+                    log::info!(
+                        "s3 request authenticated request_id={} operation={} auth_mode={:?} has_access_key={}",
+                        request_id,
+                        operation.name(),
+                        auth_context.mode,
+                        auth_context.access_key_id.is_some()
+                    );
+                    auth_context
+                }
+                Err(error) => {
+                    log::warn!(
+                        "s3 request authentication failed request_id={} operation={} status={} code={}",
+                        request_id,
+                        operation.name(),
+                        error.status().as_u16(),
+                        error.code()
+                    );
+                    return Err(error);
+                }
+            };
             let tenant = TenantId::from_principal(&auth_context.principal)
                 .map_err(|_| S3Error::access_denied("invalid custom principal id"))?;
             let tenant_context = TenantLimitContext {
