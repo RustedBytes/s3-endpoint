@@ -3,6 +3,15 @@ name = "s3-endpoint"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
+authors = ["Yehor Smoliakov <egorsmkv@gmail.com>"]
+description = "S3-compatible endpoint for upload and object-access workflows."
+license = "Apache-2.0"
+repository = "https://github.com/RustedBytes/s3-endpoint"
+homepage = "https://github.com/RustedBytes/s3-endpoint"
+documentation = "https://docs.rs/s3-endpoint"
+readme = "README.md"
+keywords = ["s3", "aws", "storage", "axum"]
+categories = ["command-line-utilities", "filesystem", "web-programming::http-server"]
 
 [dependencies]
 axum = "0.8"
