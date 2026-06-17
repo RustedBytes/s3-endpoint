@@ -19,10 +19,17 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    body::checksum::{ChecksumDigests, ChecksumRequest},
+    body::{
+        checksum::{ChecksumDigests, ChecksumRequest},
+        upload::summarize_staged_upload,
+    },
     config::{AccessKeyId, UploadLimits},
     error::S3Error,
-    s3::types::{BucketName, ETag, ObjectKey, PartNumber},
+    middleware::{
+        SharedUploadProcessor, UploadProcessorContext, UploadProcessorOperation,
+        process_staged_upload, processors_are_empty,
+    },
+    s3::types::{BucketName, ContentLength, ETag, ObjectKey, PartNumber, RequestId},
 };
 
 pub use crate::s3::types::UploadId;
@@ -194,14 +201,23 @@ impl FileObjectStore {
         temp: TempObjectWriter,
         metadata: ObjectMetadata,
     ) -> Result<(), StoreError> {
-        let TempObjectWriter {
+        self.commit_staged_object(temp.finish().await?, metadata)
+            .await
+    }
+
+    /// Atomically publishes a staged object and metadata.
+    ///
+    /// This is used by upload middleware paths that need filesystem access to a
+    /// fully decoded temporary object before it is committed.
+    pub async fn commit_staged_object(
+        &self,
+        staged: StagedObject,
+        metadata: ObjectMetadata,
+    ) -> Result<(), StoreError> {
+        let StagedObject {
             temp_id,
             path: temp_path,
-            writer,
-            bucket: _,
-            key: _,
-        } = temp;
-        drop(writer);
+        } = staged;
 
         let object_path = self.object_path(&metadata.bucket, &metadata.key);
         let metadata_path = self.metadata_path(&metadata.bucket, &metadata.key);
@@ -740,6 +756,7 @@ impl FileMultipartStore {
         requested_parts: &[CompletedPart],
         checksum_request: &ChecksumRequest,
         upload_limits: &UploadLimits,
+        processing: UploadProcessing<'_>,
     ) -> Result<ObjectMetadata, StoreError> {
         let session = self.get_open_upload(upload_id)?;
         let mut validated_parts = Vec::with_capacity(requested_parts.len());
@@ -809,12 +826,48 @@ impl FileMultipartStore {
             discard_temp_object(temp, "multipart complete temp object flush failure").await;
             return Err(StoreError::Io(error));
         }
-        let etag =
-            ETag::from_multipart_md5(hex::encode(multipart_md5.finalize()), requested_parts.len());
+        let staged = temp.finish().await?;
+        let context = UploadProcessorContext {
+            request_id: processing.request_id.clone(),
+            bucket: session.bucket.clone(),
+            key: session.key.clone(),
+            operation: UploadProcessorOperation::CompleteMultipartUpload,
+            original_size: ContentLength::new(total_size),
+            content_type: session.metadata.content_type.clone(),
+            user_metadata: session.metadata.user_metadata.clone(),
+        };
+        let staged = process_staged_upload(processing.upload_processors, staged, context)
+            .await
+            .map_err(StoreError::Processor)?;
+        let final_body = match summarize_staged_upload(staged.path()).await {
+            Ok(final_body) => final_body,
+            Err(error) => {
+                discard_staged_object(staged, "multipart complete final summary failure").await;
+                return Err(StoreError::Processor(error));
+            }
+        };
+        if final_body.size.get() > upload_limits.max_object_size {
+            discard_staged_object(
+                staged,
+                "multipart complete processed object size validation failure",
+            )
+            .await;
+            return Err(StoreError::EntityTooLarge);
+        }
+        let etag = if processors_are_empty(processing.upload_processors) {
+            ETag::from_multipart_md5(hex::encode(multipart_md5.finalize()), requested_parts.len())
+        } else {
+            ETag::from_hex_md5(hex::encode(&final_body.digests.md5))
+        };
+        let checksums = if processors_are_empty(processing.upload_processors) {
+            checksum_request.checksum_values()
+        } else {
+            checksum_request.checksum_values_for_digests(&final_body.digests)
+        };
         let metadata = ObjectMetadata {
             bucket: session.bucket.clone(),
             key: session.key.clone(),
-            size: total_size,
+            size: final_body.size.get(),
             etag,
             content_type: session.metadata.content_type,
             content_encoding: session.metadata.content_encoding,
@@ -824,11 +877,13 @@ impl FileMultipartStore {
             expires: session.metadata.expires,
             tagging: session.metadata.tagging,
             user_metadata: session.metadata.user_metadata,
-            checksums: checksum_request.checksum_values(),
+            checksums,
             last_modified: Utc::now(),
         };
 
-        object_store.commit_object(temp, metadata.clone()).await?;
+        object_store
+            .commit_staged_object(staged, metadata.clone())
+            .await?;
         if let Some(completed_session) = self.mark_upload_state(upload_id, UploadState::Completed)
             && let Err(error) = self.persist_session(&completed_session).await
         {
@@ -968,6 +1023,14 @@ pub struct CompletedPart {
     pub etag: ETag,
 }
 
+/// Upload middleware inputs for multipart completion.
+pub struct UploadProcessing<'a> {
+    /// Request ID associated with the completing request.
+    pub request_id: &'a RequestId,
+    /// Registered upload processors.
+    pub upload_processors: &'a [SharedUploadProcessor],
+}
+
 /// Temporary object writer returned by [`FileObjectStore::create_temp_object`].
 pub struct TempObjectWriter {
     temp_id: Uuid,
@@ -981,11 +1044,63 @@ pub struct TempObjectWriter {
 }
 
 impl TempObjectWriter {
+    /// Flushes and closes the writer, returning a staged object file.
+    pub async fn finish(mut self) -> Result<StagedObject, StoreError> {
+        self.writer.flush().await?;
+        let Self {
+            temp_id,
+            path,
+            writer,
+            bucket: _,
+            key: _,
+        } = self;
+        drop(writer);
+        Ok(StagedObject { temp_id, path })
+    }
+
     /// Discards the temporary object body.
     pub async fn discard(self) -> Result<(), StoreError> {
         let Self { path, writer, .. } = self;
         drop(writer);
         remove_file_if_exists(path).await
+    }
+}
+
+/// Fully written temporary object file ready for middleware or commit.
+pub struct StagedObject {
+    temp_id: Uuid,
+    path: PathBuf,
+}
+
+impl StagedObject {
+    /// Returns the path to the current staged bytes.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns a unique replacement path in the same temporary directory.
+    pub fn replacement_path(&self, replacement_id: Uuid) -> PathBuf {
+        self.path
+            .parent()
+            .map(|parent| parent.join(format!("{replacement_id}.replace")))
+            .unwrap_or_else(|| PathBuf::from(format!("{replacement_id}.replace")))
+    }
+
+    /// Replaces staged bytes with a processor-produced replacement file.
+    pub async fn replace_with(&mut self, replacement_path: PathBuf) -> Result<(), StoreError> {
+        match fs::metadata(&replacement_path).await {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => return Err(StoreError::InvalidPath(replacement_path)),
+            Err(error) => return Err(StoreError::Io(error)),
+        }
+        remove_file_if_exists(self.path.clone()).await?;
+        fs::rename(&replacement_path, &self.path).await?;
+        Ok(())
+    }
+
+    /// Deletes staged bytes.
+    pub async fn discard(self) -> Result<(), StoreError> {
+        remove_file_if_exists(self.path).await
     }
 }
 
@@ -995,6 +1110,16 @@ async fn discard_temp_object(temp: TempObjectWriter, reason: &'static str) {
             reason,
             error = %error,
             "failed to discard temporary object after storage failure"
+        );
+    }
+}
+
+async fn discard_staged_object(staged: StagedObject, reason: &'static str) {
+    if let Err(error) = staged.discard().await {
+        tracing::debug!(
+            reason,
+            error = %error,
+            "failed to discard staged object after storage failure"
         );
     }
 }
@@ -1185,6 +1310,10 @@ pub enum StoreError {
     /// Final object checksum validation failed.
     #[error("checksum validation failed")]
     Checksum(S3Error),
+
+    /// Upload middleware rejected or failed a staged object.
+    #[error("upload processor failed")]
+    Processor(S3Error),
 }
 
 #[cfg(test)]

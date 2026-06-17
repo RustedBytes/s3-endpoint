@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 use axum::{
     body::{Body, to_bytes},
@@ -7,12 +10,16 @@ use axum::{
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use bytes::Bytes;
 use crc::{CRC_32_ISCSI, CRC_32_ISO_HDLC, Crc};
+use futures_util::future::BoxFuture;
 use futures_util::stream;
 use hmac::{Hmac, Mac};
 use md5::{Digest, Md5};
 use s3_endpoint::{
     AppState,
     config::{AccessKeyConfig, AuthConfig, Config, S3Action, UploadLimits},
+    middleware::{
+        UploadProcessor, UploadProcessorAction, UploadProcessorError, UploadProcessorRequest,
+    },
     router,
     s3::types::{BucketName, ObjectKey},
 };
@@ -29,6 +36,27 @@ async fn test_state() -> (AppState, tempfile::TempDir) {
         virtual_host_base_domain: None,
         upload_limits: Default::default(),
     })
+    .await
+    .expect("create app state");
+    (state, temp_dir)
+}
+
+async fn test_state_with_processor<P>(processor: P) -> (AppState, tempfile::TempDir)
+where
+    P: UploadProcessor,
+{
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let state = AppState::builder(Config {
+        storage_root: temp_dir.path().to_path_buf(),
+        auth: AuthConfig {
+            allow_anonymous: true,
+            ..AuthConfig::default()
+        },
+        virtual_host_base_domain: None,
+        upload_limits: Default::default(),
+    })
+    .upload_processor(processor)
+    .build()
     .await
     .expect("create app state");
     (state, temp_dir)
@@ -168,6 +196,127 @@ async fn put_object_streams_to_storage_and_returns_etag() {
         metadata.user_metadata,
         BTreeMap::from([("x-amz-meta-owner".to_owned(), "rust".to_owned())])
     );
+}
+
+#[tokio::test]
+async fn put_object_processor_rejection_returns_access_denied_without_commit() {
+    let (state, _temp_dir) = test_state_with_processor(RejectProcessor).await;
+
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/test-bucket/rejected.txt")
+                .header(header::CONTENT_LENGTH, "4")
+                .body(Body::from("body"))
+                .expect("build request"),
+        )
+        .await
+        .expect("send request");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = response_text(response).await;
+    assert!(body.contains("<Code>AccessDenied</Code>"));
+    assert!(body.contains("upload rejected by test processor"));
+
+    let metadata = state
+        .object_store
+        .head_object(
+            &BucketName::parse("test-bucket").expect("bucket"),
+            &ObjectKey::parse("rejected.txt").expect("key"),
+        )
+        .await
+        .expect("read metadata");
+    assert!(metadata.is_none());
+}
+
+#[tokio::test]
+async fn put_object_processor_transform_commits_recalculated_object() {
+    let (state, _temp_dir) = test_state_with_processor(ReplaceProcessor {
+        replacement: b"clean audio".to_vec(),
+    })
+    .await;
+    let expected_etag = format!("\"{}\"", hex::encode(Md5::digest(b"clean audio")));
+
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/test-bucket/audio.wav")
+                .header(header::CONTENT_LENGTH, "5")
+                .header(header::CONTENT_TYPE, "audio/wav")
+                .body(Body::from("dirty"))
+                .expect("build request"),
+        )
+        .await
+        .expect("send request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::ETAG).expect("etag"),
+        expected_etag.as_str()
+    );
+
+    let metadata = state
+        .object_store
+        .head_object(
+            &BucketName::parse("test-bucket").expect("bucket"),
+            &ObjectKey::parse("audio.wav").expect("key"),
+        )
+        .await
+        .expect("read metadata")
+        .expect("metadata exists");
+    assert_eq!(metadata.size, "clean audio".len() as u64);
+    assert_eq!(metadata.etag.as_str(), expected_etag);
+    assert_eq!(metadata.content_type.as_deref(), Some("audio/wav"));
+
+    let object_path = stored_object_path(
+        state.config.storage_root.as_path(),
+        "test-bucket",
+        "audio.wav",
+    );
+    let stored = std::fs::read(object_path).expect("read stored object");
+    assert_eq!(stored, b"clean audio");
+}
+
+#[tokio::test]
+async fn put_object_processors_run_in_registration_order() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let state = AppState::builder(Config {
+        storage_root: temp_dir.path().to_path_buf(),
+        auth: AuthConfig {
+            allow_anonymous: true,
+            ..AuthConfig::default()
+        },
+        virtual_host_base_domain: None,
+        upload_limits: Default::default(),
+    })
+    .upload_processor(AppendProcessor { suffix: b"-one" })
+    .upload_processor(AppendProcessor { suffix: b"-two" })
+    .build()
+    .await
+    .expect("create app state");
+
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/test-bucket/chained.txt")
+                .header(header::CONTENT_LENGTH, "4")
+                .body(Body::from("base"))
+                .expect("build request"),
+        )
+        .await
+        .expect("send request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let object_path = stored_object_path(
+        state.config.storage_root.as_path(),
+        "test-bucket",
+        "chained.txt",
+    );
+    let stored = std::fs::read(object_path).expect("read stored object");
+    assert_eq!(stored, b"base-one-two");
 }
 
 #[tokio::test]
@@ -4841,6 +4990,61 @@ fn assert_has_request_id(response: &axum::response::Response) {
         .to_str()
         .expect("request id ascii");
     assert!(!value.is_empty());
+}
+
+struct RejectProcessor;
+
+impl UploadProcessor for RejectProcessor {
+    fn process<'a>(
+        &'a self,
+        _request: UploadProcessorRequest<'a>,
+    ) -> BoxFuture<'a, Result<UploadProcessorAction, UploadProcessorError>> {
+        Box::pin(async {
+            Err(UploadProcessorError::Rejected(
+                "upload rejected by test processor".to_owned(),
+            ))
+        })
+    }
+}
+
+struct ReplaceProcessor {
+    replacement: Vec<u8>,
+}
+
+impl UploadProcessor for ReplaceProcessor {
+    fn process<'a>(
+        &'a self,
+        request: UploadProcessorRequest<'a>,
+    ) -> BoxFuture<'a, Result<UploadProcessorAction, UploadProcessorError>> {
+        Box::pin(async move {
+            std::fs::write(request.replacement_path, &self.replacement)
+                .map_err(|error| UploadProcessorError::Failed(error.to_string()))?;
+            Ok(UploadProcessorAction::Replace)
+        })
+    }
+}
+
+struct AppendProcessor {
+    suffix: &'static [u8],
+}
+
+impl UploadProcessor for AppendProcessor {
+    fn process<'a>(
+        &'a self,
+        request: UploadProcessorRequest<'a>,
+    ) -> BoxFuture<'a, Result<UploadProcessorAction, UploadProcessorError>> {
+        Box::pin(async move {
+            let mut bytes = read_file(request.current_path)?;
+            bytes.extend_from_slice(self.suffix);
+            std::fs::write(request.replacement_path, bytes)
+                .map_err(|error| UploadProcessorError::Failed(error.to_string()))?;
+            Ok(UploadProcessorAction::Replace)
+        })
+    }
+}
+
+fn read_file(path: &Path) -> Result<Vec<u8>, UploadProcessorError> {
+    std::fs::read(path).map_err(|error| UploadProcessorError::Failed(error.to_string()))
 }
 
 fn canonical_headers_for_signature(input: &SignatureInput<'_>) -> String {

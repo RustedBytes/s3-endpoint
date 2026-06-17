@@ -25,7 +25,7 @@ use crate::{
         target::resolve_s3_target,
         types::{ETag, PartNumber, RequestId, UploadId},
     },
-    storage::{CompletedPart, StoreError, UploadSession},
+    storage::{CompletedPart, StoreError, UploadProcessing, UploadSession},
 };
 
 const COMPLETE_MULTIPART_XML_LIMIT: usize = 8 * 1024 * 1024;
@@ -342,6 +342,10 @@ pub(crate) async fn complete_multipart_upload(
             &parts,
             &checksum_request,
             &state.config.upload_limits,
+            UploadProcessing {
+                request_id,
+                upload_processors: state.upload_processors(),
+            },
         )
         .await
         .map_err(map_store_error)?;
@@ -531,6 +535,7 @@ fn map_store_error(error: StoreError) -> S3Error {
             S3Error::entity_too_large("Your proposed upload exceeds the maximum allowed size.")
         }
         StoreError::Checksum(error) => error,
+        StoreError::Processor(error) => error,
         other => S3Error::internal(format!("storage operation failed: {other}")),
     }
 }

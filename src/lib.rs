@@ -15,6 +15,8 @@ pub mod config;
 pub mod error;
 pub(crate) mod handlers;
 pub(crate) mod http;
+/// S3-aware upload middleware extension points.
+pub mod middleware;
 /// S3 request target parsing and validated domain value types.
 pub mod s3;
 /// Filesystem-backed object and multipart storage types.
@@ -23,6 +25,7 @@ pub mod storage;
 use std::sync::Arc;
 
 use axum::{Router, http::HeaderMap};
+use middleware::{SharedUploadProcessor, UploadProcessor};
 use storage::{FileMultipartStore, FileObjectStore};
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -32,7 +35,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 ///
 /// `AppState` owns validated configuration, credential state, filesystem-backed
 /// object and multipart stores, and bounded admission controls. Construct it
-/// with [`AppState::new`] and pass it to [`router`] to build the HTTP service.
+/// with [`AppState::new`] or [`AppState::builder`] and pass it to [`router`] to
+/// build the HTTP service.
 pub struct AppState {
     /// Validated runtime configuration.
     pub config: config::Config,
@@ -42,10 +46,19 @@ pub struct AppState {
     pub object_store: Arc<FileObjectStore>,
     /// Filesystem-backed multipart upload store.
     pub multipart_store: Arc<FileMultipartStore>,
+    pub(crate) upload_processors: Arc<Vec<SharedUploadProcessor>>,
     admission: Arc<AdmissionControl>,
 }
 
 impl AppState {
+    /// Creates a builder for application state with optional upload processors.
+    pub fn builder(config: config::Config) -> AppBuilder {
+        AppBuilder {
+            config,
+            upload_processors: Vec::new(),
+        }
+    }
+
     /// Builds application state from configuration.
     ///
     /// This validates configuration and credentials, initializes storage
@@ -53,6 +66,14 @@ impl AppState {
     /// admission controls. Returns an error when configuration is invalid or
     /// storage cannot be initialized.
     pub async fn new(config: config::Config) -> Result<Self, AppInitError> {
+        Self::builder(config).build().await
+    }
+
+    async fn from_builder(builder: AppBuilder) -> Result<Self, AppInitError> {
+        let AppBuilder {
+            config,
+            upload_processors,
+        } = builder;
         config.validate()?;
         let upload_limits = config.upload_limits.validated()?;
         let auth = Arc::new(config::AuthState::new(&config.auth)?);
@@ -63,8 +84,13 @@ impl AppState {
             auth,
             object_store,
             multipart_store,
+            upload_processors: Arc::new(upload_processors),
             admission: Arc::new(AdmissionControl::new(&upload_limits)),
         })
+    }
+
+    pub(crate) fn upload_processors(&self) -> &[SharedUploadProcessor] {
+        &self.upload_processors
     }
 
     pub(crate) fn try_acquire_s3_request(&self) -> Result<OwnedSemaphorePermit, error::S3Error> {
@@ -119,6 +145,31 @@ impl AppState {
     }
 }
 
+/// Builder for [`AppState`].
+pub struct AppBuilder {
+    config: config::Config,
+    upload_processors: Vec<SharedUploadProcessor>,
+}
+
+impl AppBuilder {
+    /// Registers an upload processor.
+    ///
+    /// Processors run sequentially in registration order after decoded upload
+    /// bytes have been validated and before the final object is committed.
+    pub fn upload_processor<P>(mut self, processor: P) -> Self
+    where
+        P: UploadProcessor,
+    {
+        self.upload_processors.push(Arc::new(processor));
+        self
+    }
+
+    /// Builds application state.
+    pub async fn build(self) -> Result<AppState, AppInitError> {
+        AppState::from_builder(self).await
+    }
+}
+
 struct AdmissionControl {
     s3_requests: Arc<Semaphore>,
     object_writers: Arc<Semaphore>,
@@ -168,6 +219,7 @@ mod tests {
         body::Body,
         http::{HeaderMap, HeaderValue, Request, StatusCode},
     };
+    use futures_util::future::BoxFuture;
     use tower::ServiceExt;
 
     #[tokio::test]
@@ -196,6 +248,54 @@ mod tests {
                 "max_part_size must be greater than 0"
             ))
         ));
+    }
+
+    #[tokio::test]
+    async fn app_state_builder_registers_upload_processors_in_order() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let state = AppState::builder(config::Config {
+            storage_root: temp_dir.path().to_path_buf(),
+            auth: Default::default(),
+            virtual_host_base_domain: None,
+            upload_limits: Default::default(),
+        })
+        .upload_processor(NamedProcessor("first"))
+        .upload_processor(NamedProcessor("second"))
+        .build()
+        .await
+        .expect("create app state");
+
+        assert_eq!(state.upload_processors.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn app_state_new_registers_no_upload_processors() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let state = AppState::new(config::Config {
+            storage_root: temp_dir.path().to_path_buf(),
+            auth: Default::default(),
+            virtual_host_base_domain: None,
+            upload_limits: Default::default(),
+        })
+        .await
+        .expect("create app state");
+
+        assert!(state.upload_processors.is_empty());
+    }
+
+    struct NamedProcessor(&'static str);
+
+    impl middleware::UploadProcessor for NamedProcessor {
+        fn process<'a>(
+            &'a self,
+            _request: middleware::UploadProcessorRequest<'a>,
+        ) -> BoxFuture<
+            'a,
+            Result<middleware::UploadProcessorAction, middleware::UploadProcessorError>,
+        > {
+            let _name = self.0;
+            Box::pin(async { Ok(middleware::UploadProcessorAction::Keep) })
+        }
     }
 
     #[tokio::test]

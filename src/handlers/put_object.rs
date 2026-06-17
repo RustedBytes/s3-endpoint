@@ -6,14 +6,20 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::Response,
 };
-use tokio::io::AsyncWriteExt;
 
 use crate::{
     AppState, auth,
-    body::upload::write_upload_body,
+    body::{
+        checksum::checksum_values_for_requested_headers,
+        upload::{summarize_staged_upload, write_upload_body},
+    },
     config::S3Action,
     error::S3Error,
     handlers::validate_supported_request_body_length,
+    middleware::{
+        UploadProcessorContext, UploadProcessorOperation, process_staged_upload,
+        processors_are_empty,
+    },
     s3::{
         target::resolve_s3_target,
         types::{ETag, RequestId},
@@ -79,18 +85,54 @@ pub(crate) async fn handle_put_object(
             return Err(error);
         }
     };
-    if let Err(err) = temp.writer.flush().await {
-        discard_temp_object(temp, "object body flush failure").await;
-        return Err(S3Error::internal(format!(
-            "failed to flush object body: {err}"
-        )));
+    let staged = match temp.finish().await {
+        Ok(staged) => staged,
+        Err(error) => {
+            return Err(S3Error::internal(format!(
+                "failed to flush object body: {error}"
+            )));
+        }
+    };
+
+    let context = UploadProcessorContext {
+        request_id: request_id.clone(),
+        bucket: target.bucket.clone(),
+        key: target.key.clone(),
+        operation: UploadProcessorOperation::PutObject,
+        original_size: uploaded_body.size,
+        content_type: upload_metadata.content_type.clone(),
+        user_metadata: upload_metadata.user_metadata.clone(),
+    };
+    let staged = match process_staged_upload(state.upload_processors(), staged, context).await {
+        Ok(staged) => staged,
+        Err(error) => {
+            return Err(error);
+        }
+    };
+    let final_body = match summarize_staged_upload(staged.path()).await {
+        Ok(final_body) => final_body,
+        Err(error) => {
+            let _ = staged.discard().await;
+            return Err(error);
+        }
+    };
+    if final_body.size.get() > state.config.upload_limits.max_object_size {
+        let _ = staged.discard().await;
+        return Err(S3Error::entity_too_large(
+            "Your proposed upload exceeds the maximum allowed size.",
+        ));
     }
 
-    let etag = ETag::from_hex_md5(hex::encode(&uploaded_body.md5_digest));
+    let etag = ETag::from_hex_md5(hex::encode(&final_body.digests.md5));
+    let response_checksums = if processors_are_empty(state.upload_processors()) {
+        uploaded_body.checksums.clone()
+    } else {
+        checksum_values_for_requested_headers(&uploaded_body.checksums, &final_body.digests)
+    };
     let metadata = ObjectMetadata {
         bucket: target.bucket.clone(),
         key: target.key.clone(),
-        size: uploaded_body.size.get(),
+        size: final_body.size.get(),
         etag: etag.clone(),
         content_type: upload_metadata.content_type,
         content_encoding: upload_metadata.content_encoding,
@@ -100,13 +142,13 @@ pub(crate) async fn handle_put_object(
         expires: upload_metadata.expires,
         tagging: upload_metadata.tagging,
         user_metadata: upload_metadata.user_metadata,
-        checksums: uploaded_body.checksums.clone(),
+        checksums: response_checksums.clone(),
         last_modified: chrono::Utc::now(),
     };
 
     state
         .object_store
-        .commit_object(temp, metadata)
+        .commit_staged_object(staged, metadata)
         .await
         .map_err(|err| S3Error::internal(format!("failed to commit object: {err}")))?;
 
@@ -115,10 +157,10 @@ pub(crate) async fn handle_put_object(
         .header(header::ETAG, etag.as_str())
         .header("x-amz-request-id", request_id.as_str())
         .header(header::CONTENT_LENGTH, "0");
-    if !uploaded_body.checksums.is_empty() {
+    if !response_checksums.is_empty() {
         response = response.header("x-amz-checksum-type", "FULL_OBJECT");
     }
-    for (name, value) in &uploaded_body.checksums {
+    for (name, value) in &response_checksums {
         response = response.header(name, value);
     }
     let response = response
@@ -127,7 +169,7 @@ pub(crate) async fn handle_put_object(
 
     Ok(crate::handlers::s3::record_decoded_body_bytes(
         response,
-        uploaded_body.size.get(),
+        final_body.size.get(),
     ))
 }
 

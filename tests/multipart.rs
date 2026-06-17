@@ -1,4 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use axum::{
     body::{Body, to_bytes},
@@ -7,15 +13,19 @@ use axum::{
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use bytes::Bytes;
 use crc::{CRC_32_ISO_HDLC, Crc};
-use futures_util::stream;
+use futures_util::{future::BoxFuture, stream};
 use md5::{Digest as _, Md5};
 use s3_endpoint::{
     AppState,
     config::{AccessKeyConfig, AuthConfig, Config, S3Action, UploadLimits},
+    middleware::{
+        UploadProcessor, UploadProcessorAction, UploadProcessorError, UploadProcessorRequest,
+    },
     router,
     s3::types::{BucketName, ObjectKey, PartNumber},
     storage::{ChecksumAlgorithm, ChecksumType, UploadId, UploadState},
 };
+use tokio::io::AsyncReadExt;
 use tower::ServiceExt;
 
 mod common;
@@ -125,6 +135,90 @@ async fn multipart_create_upload_list_and_complete() {
     );
     assert!(metadata.etag.as_str().ends_with("-2\""));
     assert!(!temp_dir.path().join("multipart").join(&upload_id).exists());
+}
+
+#[tokio::test]
+async fn multipart_processors_run_when_upload_is_completed() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let state = AppState::builder(Config {
+        storage_root: temp_dir.path().to_path_buf(),
+        auth: AuthConfig {
+            allow_anonymous: true,
+            ..AuthConfig::default()
+        },
+        virtual_host_base_domain: None,
+        upload_limits: Default::default(),
+    })
+    .upload_processor(CountingReplaceProcessor {
+        calls: Arc::clone(&calls),
+        replacement: b"clean multipart".to_vec(),
+    })
+    .build()
+    .await
+    .expect("create app state");
+    let app = router(state.clone());
+
+    let upload_id = create_upload(app.clone(), "/test-bucket/processed-multipart.txt").await;
+    let etag = upload_part_for_key(
+        app.clone(),
+        &upload_id,
+        "processed-multipart.txt",
+        1,
+        "dirty multipart",
+    )
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let complete_xml = format!(
+        "<CompleteMultipartUpload>\
+         <Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part>\
+         </CompleteMultipartUpload>"
+    );
+    let complete = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/test-bucket/processed-multipart.txt?uploadId={upload_id}"
+                ))
+                .header(header::CONTENT_LENGTH, complete_xml.len().to_string())
+                .body(Body::from(complete_xml))
+                .expect("build complete"),
+        )
+        .await
+        .expect("send complete");
+
+    assert_eq!(complete.status(), StatusCode::OK);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let metadata = state
+        .object_store
+        .head_object(
+            &BucketName::parse("test-bucket").expect("bucket"),
+            &ObjectKey::parse("processed-multipart.txt").expect("key"),
+        )
+        .await
+        .expect("read metadata")
+        .expect("metadata exists");
+    assert_eq!(metadata.size, "clean multipart".len() as u64);
+    assert_eq!(
+        metadata.etag.as_str(),
+        format!("\"{}\"", hex::encode(Md5::digest(b"clean multipart")))
+    );
+
+    let (_metadata, mut file) = state
+        .object_store
+        .open_object(
+            &BucketName::parse("test-bucket").expect("bucket"),
+            &ObjectKey::parse("processed-multipart.txt").expect("key"),
+        )
+        .await
+        .expect("open object")
+        .expect("object exists");
+    let mut stored = Vec::new();
+    file.read_to_end(&mut stored).await.expect("read object");
+    assert_eq!(stored, b"clean multipart");
 }
 
 #[tokio::test]
@@ -4718,4 +4812,23 @@ fn split_body(bytes: Vec<u8>, chunk_size: usize) -> Body {
         .map(|chunk| Ok::<_, std::convert::Infallible>(Bytes::copy_from_slice(chunk)))
         .collect::<Vec<_>>();
     Body::from_stream(stream::iter(chunks))
+}
+
+struct CountingReplaceProcessor {
+    calls: Arc<AtomicUsize>,
+    replacement: Vec<u8>,
+}
+
+impl UploadProcessor for CountingReplaceProcessor {
+    fn process<'a>(
+        &'a self,
+        request: UploadProcessorRequest<'a>,
+    ) -> BoxFuture<'a, Result<UploadProcessorAction, UploadProcessorError>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::fs::write(request.replacement_path, &self.replacement)
+                .map_err(|error| UploadProcessorError::Failed(error.to_string()))?;
+            Ok(UploadProcessorAction::Replace)
+        })
+    }
 }

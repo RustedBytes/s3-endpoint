@@ -129,6 +129,44 @@ impl ChecksumRequest {
         self.checksum_values.clone()
     }
 
+    pub(crate) fn checksum_values_for_digests(
+        &self,
+        digests: &ChecksumDigests,
+    ) -> BTreeMap<String, String> {
+        let mut values = BTreeMap::new();
+        if self.checksum_crc32.is_some() {
+            values.insert(
+                "x-amz-checksum-crc32".to_owned(),
+                BASE64.encode(digests.crc32.to_be_bytes()),
+            );
+        }
+        if self.checksum_crc32c.is_some() {
+            values.insert(
+                "x-amz-checksum-crc32c".to_owned(),
+                BASE64.encode(digests.crc32c.to_be_bytes()),
+            );
+        }
+        if self.checksum_sha1.is_some() {
+            values.insert(
+                "x-amz-checksum-sha1".to_owned(),
+                BASE64.encode(&digests.sha1),
+            );
+        }
+        if self.checksum_sha256.is_some() {
+            values.insert(
+                "x-amz-checksum-sha256".to_owned(),
+                BASE64.encode(&digests.sha256),
+            );
+        }
+        if self.checksum_sha512.is_some() {
+            values.insert(
+                "x-amz-checksum-sha512".to_owned(),
+                BASE64.encode(&digests.sha512),
+            );
+        }
+        values
+    }
+
     pub(crate) fn requires_md5(&self) -> bool {
         self.content_md5.is_some()
     }
@@ -162,6 +200,26 @@ pub struct ChecksumDigests {
     pub sha512: Vec<u8>,
     pub crc32: u32,
     pub crc32c: u32,
+}
+
+pub(crate) fn checksum_values_for_requested_headers(
+    requested: &BTreeMap<String, String>,
+    digests: &ChecksumDigests,
+) -> BTreeMap<String, String> {
+    requested
+        .keys()
+        .filter_map(|name| {
+            let value = match name.as_str() {
+                "x-amz-checksum-crc32" => BASE64.encode(digests.crc32.to_be_bytes()),
+                "x-amz-checksum-crc32c" => BASE64.encode(digests.crc32c.to_be_bytes()),
+                "x-amz-checksum-sha1" => BASE64.encode(&digests.sha1),
+                "x-amz-checksum-sha256" => BASE64.encode(&digests.sha256),
+                "x-amz-checksum-sha512" => BASE64.encode(&digests.sha512),
+                _ => return None,
+            };
+            Some((name.clone(), value))
+        })
+        .collect()
 }
 
 fn checksum_values(

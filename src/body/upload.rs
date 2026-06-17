@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 
 use axum::{
     body::Body,
@@ -11,6 +11,7 @@ use md5::{Digest, Md5};
 use sha1::Sha1;
 use sha2::{Sha256, Sha512};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::{fs::File, io::AsyncReadExt};
 
 use crate::{
     auth::StreamingSigningContext,
@@ -30,6 +31,56 @@ pub struct UploadedBody {
     pub size: ContentLength,
     pub md5_digest: Vec<u8>,
     pub checksums: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct FinalUploadBody {
+    pub size: ContentLength,
+    pub digests: ChecksumDigests,
+}
+
+pub(crate) async fn summarize_staged_upload(path: &Path) -> Result<FinalUploadBody, S3Error> {
+    let mut file = File::open(path)
+        .await
+        .map_err(|err| S3Error::internal(format!("failed to open staged upload: {err}")))?;
+    let mut md5 = Md5::new();
+    let mut sha1 = Sha1::new();
+    let mut sha256 = Sha256::new();
+    let mut sha512 = Sha512::new();
+    let mut crc32 = CRC32.digest();
+    let mut crc32c = CRC32C.digest();
+    let mut size = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|err| S3Error::internal(format!("failed to read staged upload: {err}")))?;
+        if read == 0 {
+            break;
+        }
+        let chunk = &buffer[..read];
+        size = size.saturating_add(read as u64);
+        md5.update(chunk);
+        sha1.update(chunk);
+        sha256.update(chunk);
+        sha512.update(chunk);
+        crc32.update(chunk);
+        crc32c.update(chunk);
+    }
+
+    Ok(FinalUploadBody {
+        size: ContentLength::new(size),
+        digests: ChecksumDigests {
+            md5: md5.finalize().to_vec(),
+            sha1: sha1.finalize().to_vec(),
+            sha256: sha256.finalize().to_vec(),
+            sha512: sha512.finalize().to_vec(),
+            crc32: crc32.finalize(),
+            crc32c: crc32c.finalize(),
+        },
+    })
 }
 
 pub async fn write_upload_body<W>(
