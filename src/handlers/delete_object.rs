@@ -17,7 +17,8 @@ pub(crate) async fn delete_object(
     request: Request<Body>,
     request_id: &RequestId,
 ) -> Result<Response, S3Error> {
-    let (_, target) = authenticate_and_authorize_target(&state, &request, S3Action::DeleteObject)?;
+    let (_, target) =
+        authenticate_and_authorize_target(&state, &request, S3Action::DeleteObject).await?;
     validate_empty_payload_hash(&request)?;
 
     state

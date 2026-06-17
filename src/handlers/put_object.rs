@@ -37,7 +37,7 @@ pub(crate) async fn handle_put_object(
     let headers = request.headers().clone();
     validate_supported_request_body_length(&headers).map_err(|error| error.with_resource(path))?;
     validate_upload_headers(&headers)?;
-    let auth_context = authenticate_request(&state, &request)?;
+    let auth_context = authenticate_request(&state, &request).await?;
     authorize_request(
         &state,
         &auth_context,

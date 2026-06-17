@@ -19,7 +19,8 @@ pub(crate) async fn head_object(
     request: Request<Body>,
     request_id: &RequestId,
 ) -> Result<Response, S3Error> {
-    let (_, target) = authenticate_and_authorize_target(&state, &request, S3Action::HeadObject)?;
+    let (_, target) =
+        authenticate_and_authorize_target(&state, &request, S3Action::HeadObject).await?;
     validate_empty_payload_hash(&request)?;
 
     let metadata = state

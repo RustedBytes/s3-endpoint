@@ -34,8 +34,9 @@ use axum::{
     routing::Route,
 };
 use hooks::{
-    AuthorizationContext, AuthorizationPolicy, ErrorMapper, RequestIdFactory, RequestObserver,
-    S3ErrorContext, S3RequestContext, SharedAuthorizationPolicy, SharedErrorMapper,
+    AuthenticationProvider, AuthenticationRequest, AuthenticationResult, AuthorizationContext,
+    AuthorizationPolicy, ErrorMapper, RequestIdFactory, RequestObserver, S3ErrorContext,
+    S3RequestContext, SharedAuthenticationProvider, SharedAuthorizationPolicy, SharedErrorMapper,
     SharedRequestIdFactory, SharedRequestObserver,
 };
 use middleware::{
@@ -67,6 +68,7 @@ pub struct AppState {
     request_observer: Option<SharedRequestObserver>,
     error_mapper: Option<SharedErrorMapper>,
     request_id_factory: SharedRequestIdFactory,
+    authentication_provider: Option<SharedAuthenticationProvider>,
     authorization_policy: Option<SharedAuthorizationPolicy>,
     admission: Arc<AdmissionControl>,
 }
@@ -80,6 +82,7 @@ impl AppState {
             request_observer: None,
             error_mapper: None,
             request_id_factory: Arc::new(s3::types::RequestId::new),
+            authentication_provider: None,
             authorization_policy: None,
             health_path: Some("/health".to_owned()),
             router_layers: Vec::new(),
@@ -103,6 +106,7 @@ impl AppState {
             request_observer,
             error_mapper,
             request_id_factory,
+            authentication_provider,
             authorization_policy,
             health_path: _,
             router_layers: _,
@@ -121,6 +125,7 @@ impl AppState {
             request_observer,
             error_mapper,
             request_id_factory,
+            authentication_provider,
             authorization_policy,
             admission: Arc::new(AdmissionControl::new(&upload_limits)),
         })
@@ -132,6 +137,14 @@ impl AppState {
 
     pub(crate) fn request_id(&self) -> s3::types::RequestId {
         self.request_id_factory.request_id()
+    }
+
+    pub(crate) async fn authenticate_with_provider(
+        &self,
+        request: AuthenticationRequest,
+    ) -> Option<Result<AuthenticationResult, error::S3Error>> {
+        let provider = self.authentication_provider.as_ref()?;
+        Some(provider.authenticate(request).await)
     }
 
     pub(crate) async fn observe_request(&self, context: S3RequestContext) {
@@ -222,6 +235,7 @@ pub struct AppBuilder {
     request_observer: Option<SharedRequestObserver>,
     error_mapper: Option<SharedErrorMapper>,
     request_id_factory: SharedRequestIdFactory,
+    authentication_provider: Option<SharedAuthenticationProvider>,
     authorization_policy: Option<SharedAuthorizationPolicy>,
     health_path: Option<String>,
     router_layers: Vec<RouterTransform>,
@@ -306,6 +320,19 @@ impl AppBuilder {
         F: RequestIdFactory,
     {
         self.request_id_factory = Arc::new(factory);
+        self
+    }
+
+    /// Registers a custom authentication provider.
+    ///
+    /// When configured, this provider replaces the built-in static SigV4 and
+    /// anonymous authentication path. Built-in SigV4 remains the default when
+    /// no custom provider is registered.
+    pub fn authentication_provider<P>(mut self, provider: P) -> Self
+    where
+        P: AuthenticationProvider,
+    {
+        self.authentication_provider = Some(Arc::new(provider));
         self
     }
 
@@ -564,6 +591,87 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn authentication_provider_can_replace_static_auth() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let app = AppState::builder(config::Config::new(temp_dir.path().to_path_buf()))
+            .authentication_provider(|request: hooks::AuthenticationRequest| async move {
+                if request
+                    .headers
+                    .get("x-api-key")
+                    .and_then(|value| value.to_str().ok())
+                    == Some("let-me-in")
+                {
+                    Ok(hooks::AuthenticationResult::custom("tenant-a"))
+                } else {
+                    Err(error::S3Error::access_denied("invalid api key"))
+                }
+            })
+            .build_router()
+            .await
+            .expect("router");
+
+        let allowed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/test-bucket")
+                    .header("x-api-key", "let-me-in")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("allowed response");
+        assert_eq!(allowed.status(), StatusCode::OK);
+
+        let denied = app
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/test-bucket")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("denied response");
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn authorization_policy_receives_custom_auth_principal() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let app = AppState::builder(config::Config::new(temp_dir.path().to_path_buf()))
+            .authentication_provider(|_request: hooks::AuthenticationRequest| async {
+                Ok(hooks::AuthenticationResult::custom("tenant-a"))
+            })
+            .authorization_policy(|context: hooks::AuthorizationContext| {
+                assert_eq!(
+                    context.principal,
+                    hooks::RequestPrincipal::Custom {
+                        id: "tenant-a".to_owned()
+                    }
+                );
+                Ok(())
+            })
+            .build_router()
+            .await
+            .expect("router");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/test-bucket")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

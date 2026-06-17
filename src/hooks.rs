@@ -2,7 +2,7 @@
 
 use std::{fmt, future::Future, sync::Arc};
 
-use axum::http::Method;
+use axum::http::{HeaderMap, Method, Uri};
 use futures_util::future::BoxFuture;
 
 use crate::{
@@ -19,6 +19,8 @@ pub type SharedErrorMapper = Arc<dyn ErrorMapper>;
 pub type SharedRequestIdFactory = Arc<dyn RequestIdFactory>;
 /// Shared authorization policy object.
 pub type SharedAuthorizationPolicy = Arc<dyn AuthorizationPolicy>;
+/// Shared authentication provider object.
+pub type SharedAuthenticationProvider = Arc<dyn AuthenticationProvider>;
 
 /// Authenticated principal visible to tuning hooks.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -30,6 +32,66 @@ pub enum RequestPrincipal {
         /// Access key ID used by the request.
         access_key_id: AccessKeyId,
     },
+    /// Application-defined authenticated principal.
+    Custom {
+        /// Stable principal identifier.
+        id: String,
+    },
+}
+
+/// Request data passed to a custom authentication provider.
+#[derive(Clone, Debug)]
+pub struct AuthenticationRequest {
+    /// HTTP method.
+    pub method: Method,
+    /// Full request URI.
+    pub uri: Uri,
+    /// Request headers.
+    pub headers: HeaderMap,
+}
+
+/// Authentication result returned by a custom provider.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticationResult {
+    principal: RequestPrincipal,
+    access_key_id: Option<AccessKeyId>,
+}
+
+impl AuthenticationResult {
+    /// Authenticates the request as an anonymous principal.
+    pub fn anonymous() -> Self {
+        Self {
+            principal: RequestPrincipal::Anonymous,
+            access_key_id: None,
+        }
+    }
+
+    /// Authenticates the request as an access-key principal.
+    pub fn access_key(access_key_id: AccessKeyId) -> Self {
+        Self {
+            principal: RequestPrincipal::AccessKey {
+                access_key_id: access_key_id.clone(),
+            },
+            access_key_id: Some(access_key_id),
+        }
+    }
+
+    /// Authenticates the request as an application-defined principal.
+    pub fn custom(id: impl Into<String>) -> Self {
+        Self {
+            principal: RequestPrincipal::Custom { id: id.into() },
+            access_key_id: None,
+        }
+    }
+
+    /// Returns the authenticated principal.
+    pub fn principal(&self) -> &RequestPrincipal {
+        &self.principal
+    }
+
+    pub(crate) fn into_parts(self) -> (RequestPrincipal, Option<AccessKeyId>) {
+        (self.principal, self.access_key_id)
+    }
 }
 
 /// Read-only S3 request metadata passed to request observers.
@@ -79,6 +141,28 @@ pub struct AuthorizationContext {
 pub trait RequestObserver: Send + Sync + 'static {
     /// Observes a request. Returning normally must not change request handling.
     fn observe<'a>(&'a self, context: S3RequestContext) -> BoxFuture<'a, ()>;
+}
+
+/// Custom authentication provider for embedded applications.
+pub trait AuthenticationProvider: Send + Sync + 'static {
+    /// Authenticates the request or returns an S3 error to reject it.
+    fn authenticate<'a>(
+        &'a self,
+        request: AuthenticationRequest,
+    ) -> BoxFuture<'a, Result<AuthenticationResult, S3Error>>;
+}
+
+impl<F, Fut> AuthenticationProvider for F
+where
+    F: Fn(AuthenticationRequest) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<AuthenticationResult, S3Error>> + Send + 'static,
+{
+    fn authenticate<'a>(
+        &'a self,
+        request: AuthenticationRequest,
+    ) -> BoxFuture<'a, Result<AuthenticationResult, S3Error>> {
+        Box::pin((self)(request))
+    }
 }
 
 impl<F, Fut> RequestObserver for F
@@ -142,6 +226,7 @@ impl fmt::Display for RequestPrincipal {
         match self {
             Self::Anonymous => formatter.write_str("anonymous"),
             Self::AccessKey { access_key_id } => write!(formatter, "{access_key_id}"),
+            Self::Custom { id } => formatter.write_str(id),
         }
     }
 }

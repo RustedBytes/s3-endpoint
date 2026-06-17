@@ -37,6 +37,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = AppState::builder(config)
         .health_path("/ready")
+        .authentication_provider(|request| async move {
+            if request
+                .headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+                == Some("let-me-in")
+            {
+                return Ok(s3_endpoint::hooks::AuthenticationResult::custom("tenant-a"));
+            }
+            Err(S3Error::access_denied("invalid api key"))
+        })
         .upload_processor_fn("antivirus", |upload| async move {
             let bytes = upload.read_current().await?;
             if bytes.windows(b"EICAR".len()).any(|window| window == b"EICAR") {
@@ -73,6 +84,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 `AppState::new(config)` and `router(state)` still work and create a server with
 the default `/health` route and no upload processors.
+
+When `authentication_provider` is configured, it replaces the built-in static
+SigV4/anonymous authentication path. Leave it unset to keep the default S3
+SigV4 behavior, including signed aws-chunked upload verification.
 
 ## Register Processors
 

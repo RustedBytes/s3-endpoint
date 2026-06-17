@@ -3,13 +3,14 @@ use axum::{
     http::{Request, header},
 };
 use sha2::Digest as Sha2Digest;
+use std::future::Future;
 
 use crate::{
     AppState, auth,
     body::upload::validate_fixed_sha256_payload_hash,
     config::S3Action,
     error::S3Error,
-    hooks::{AuthorizationContext, RequestPrincipal},
+    hooks::{AuthenticationRequest, AuthorizationContext},
     s3::{
         target::{resolve_bucket_name, resolve_s3_target},
         types::{BucketName, ObjectKey, S3Target},
@@ -19,13 +20,31 @@ use crate::{
 pub(crate) fn authenticate_request(
     state: &AppState,
     request: &Request<Body>,
-) -> Result<auth::AuthContext, S3Error> {
-    auth::authenticate(
-        &state.auth,
-        request.method(),
-        request.uri(),
-        request.headers(),
-    )
+) -> impl Future<Output = Result<auth::AuthContext, S3Error>> + Send + 'static {
+    let state = state.clone();
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let headers = request.headers().clone();
+    async move {
+        if let Some(result) = state
+            .authenticate_with_provider(AuthenticationRequest {
+                method: method.clone(),
+                uri: uri.clone(),
+                headers: headers.clone(),
+            })
+            .await
+        {
+            let (principal, access_key_id) = result?.into_parts();
+            return Ok(auth::AuthContext {
+                mode: auth::AuthMode::Custom,
+                principal,
+                access_key_id,
+                streaming_signing: None,
+            });
+        }
+
+        auth::authenticate(&state.auth, &method, &uri, &headers)
+    }
 }
 
 pub(crate) fn resolve_request_target(
@@ -69,7 +88,7 @@ pub(crate) fn authorize_request(
 ) -> Result<(), S3Error> {
     auth::authorize(&state.auth, auth_context, bucket, action)?;
     state.authorize_with_policy(AuthorizationContext {
-        principal: principal_from_auth(auth_context),
+        principal: auth_context.principal.clone(),
         bucket: bucket.clone(),
         key: key.cloned(),
         action,
@@ -80,29 +99,25 @@ pub(crate) fn authenticate_and_authorize_target(
     state: &AppState,
     request: &Request<Body>,
     action: S3Action,
-) -> Result<(auth::AuthContext, S3Target), S3Error> {
-    let auth_context = authenticate_request(state, request)?;
-    let target = resolve_request_target(state, request)?;
-    authorize_request(
-        state,
-        &auth_context,
-        &target.bucket,
-        Some(&target.key),
-        action,
-    )?;
-    Ok((auth_context, target))
+) -> impl Future<Output = Result<(auth::AuthContext, S3Target), S3Error>> + Send + 'static {
+    let auth = authenticate_request(state, request);
+    let target = resolve_request_target(state, request);
+    let state = state.clone();
+    async move {
+        let auth_context = auth.await?;
+        let target = target?;
+        authorize_request(
+            &state,
+            &auth_context,
+            &target.bucket,
+            Some(&target.key),
+            action,
+        )?;
+        Ok((auth_context, target))
+    }
 }
 
 pub(crate) fn validate_empty_payload_hash(request: &Request<Body>) -> Result<(), S3Error> {
     let empty_payload_digest = sha2::Sha256::digest([]);
     validate_fixed_sha256_payload_hash(request.headers(), empty_payload_digest.as_ref())
-}
-
-fn principal_from_auth(auth_context: &auth::AuthContext) -> RequestPrincipal {
-    match &auth_context.access_key_id {
-        Some(access_key_id) => RequestPrincipal::AccessKey {
-            access_key_id: access_key_id.clone(),
-        },
-        None => RequestPrincipal::Anonymous,
-    }
 }

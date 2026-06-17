@@ -11,6 +11,7 @@ use crate::{
     body::upload::payload_hash_mode,
     config::{AccessKeyId, AuthState, S3Action},
     error::S3Error,
+    hooks::RequestPrincipal,
     s3::types::BucketName,
 };
 
@@ -57,6 +58,9 @@ pub fn authenticate(
             .map_err(map_auth_error)
             .map(|header_auth| AuthContext {
                 mode: AuthMode::HeaderSigV4,
+                principal: RequestPrincipal::AccessKey {
+                    access_key_id: header_auth.access_key_id.clone(),
+                },
                 access_key_id: Some(header_auth.access_key_id),
                 streaming_signing: Some(header_auth.streaming_signing),
             })
@@ -65,12 +69,16 @@ pub fn authenticate(
             .map_err(map_auth_error)
             .map(|access_key_id| AuthContext {
                 mode: AuthMode::PresignedUrl,
+                principal: RequestPrincipal::AccessKey {
+                    access_key_id: access_key_id.clone(),
+                },
                 access_key_id: Some(access_key_id),
                 streaming_signing: None,
             })
     } else if config.allow_anonymous() {
         Ok(AuthContext {
             mode: AuthMode::Anonymous,
+            principal: RequestPrincipal::Anonymous,
             access_key_id: None,
             streaming_signing: None,
         })
@@ -91,6 +99,9 @@ pub fn authorize(
     bucket: &BucketName,
     action: S3Action,
 ) -> Result<(), S3Error> {
+    if auth.mode == AuthMode::Custom {
+        return Ok(());
+    }
     if auth.mode == AuthMode::Anonymous {
         if config.permits_anonymous_bucket(bucket) {
             return Ok(());
@@ -580,6 +591,8 @@ fn map_auth_error(error: AuthError) -> S3Error {
 pub struct AuthContext {
     /// Authentication mode used for the request.
     pub mode: AuthMode,
+    /// Authenticated principal.
+    pub principal: RequestPrincipal,
     /// Access key ID for signed requests, or `None` for anonymous requests.
     pub access_key_id: Option<AccessKeyId>,
     /// Streaming signing data for signed aws-chunked uploads.
@@ -613,6 +626,8 @@ pub enum AuthMode {
     PresignedUrl,
     /// Anonymous access allowed by configuration.
     Anonymous,
+    /// Application-defined custom authentication.
+    Custom,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]

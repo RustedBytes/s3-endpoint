@@ -26,7 +26,8 @@ pub(crate) async fn get_object(
     request: Request<Body>,
     request_id: &RequestId,
 ) -> Result<Response, S3Error> {
-    let (_, target) = authenticate_and_authorize_target(&state, &request, S3Action::GetObject)?;
+    let (_, target) =
+        authenticate_and_authorize_target(&state, &request, S3Action::GetObject).await?;
     validate_empty_payload_hash(&request)?;
 
     let (metadata, mut file) = state

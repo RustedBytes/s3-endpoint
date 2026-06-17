@@ -37,7 +37,7 @@ pub(crate) async fn create_multipart_upload(
     request: Request<Body>,
     request_id: &RequestId,
 ) -> Result<Response, S3Error> {
-    let auth_context = authenticate_request(&state, &request)?;
+    let auth_context = authenticate_request(&state, &request).await?;
     validate_empty_request_body_headers(request.headers(), "CreateMultipartUpload")?;
     validate_upload_headers(request.headers())?;
     validate_empty_payload_hash(&request)?;
@@ -81,7 +81,7 @@ pub(crate) async fn upload_part(
     upload_id: UploadId,
     part_number: PartNumber,
 ) -> Result<Response, S3Error> {
-    let auth_context = authenticate_request(&state, &request)?;
+    let auth_context = authenticate_request(&state, &request).await?;
     validate_supported_request_body_length(request.headers())?;
     validate_upload_headers(request.headers())?;
     let headers = request.headers().clone();
@@ -168,7 +168,7 @@ pub(crate) async fn list_parts(
     request_id: &RequestId,
     upload_id: UploadId,
 ) -> Result<Response, S3Error> {
-    let auth_context = authenticate_request(&state, &request)?;
+    let auth_context = authenticate_request(&state, &request).await?;
     let query = request.uri().query().unwrap_or_default();
     let page = ListPartsPageRequest::parse(query)?;
     let session = validate_upload_session_target(&state, &request, &auth_context, &upload_id)?;
@@ -264,7 +264,7 @@ pub(crate) async fn abort_multipart_upload(
     request_id: &RequestId,
     upload_id: UploadId,
 ) -> Result<Response, S3Error> {
-    let auth_context = authenticate_request(&state, &request)?;
+    let auth_context = authenticate_request(&state, &request).await?;
     validate_empty_request_body_headers(request.headers(), "AbortMultipartUpload")?;
     let session = validate_upload_session_target(&state, &request, &auth_context, &upload_id)?;
     authorize_request(
@@ -295,7 +295,7 @@ pub(crate) async fn complete_multipart_upload(
     request_id: &RequestId,
     upload_id: UploadId,
 ) -> Result<Response, S3Error> {
-    let auth_context = authenticate_request(&state, &request)?;
+    let auth_context = authenticate_request(&state, &request).await?;
     let headers = request.headers().clone();
     let location = completion_location(&request);
     let session = validate_upload_session_target(&state, &request, &auth_context, &upload_id)?;
