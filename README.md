@@ -1,5 +1,7 @@
 # s3-endpoint
 
+[![CI](https://github.com/RustedBytes/s3-endpoint/actions/workflows/ci.yml/badge.svg)](https://github.com/RustedBytes/s3-endpoint/actions/workflows/ci.yml)
+
 Rust S3-compatible endpoint focused on upload and object-access workflows used by AWS SDKs and the AWS CLI.
 
 The implementation targets Rust 1.95, edition 2024, and forbids unsafe code in application modules.
