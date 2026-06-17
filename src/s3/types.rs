@@ -156,6 +156,59 @@ impl fmt::Display for RequestId {
     }
 }
 
+/// Multipart upload identifier.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
+pub struct UploadId(String);
+
+impl UploadId {
+    /// Creates a new random upload ID.
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+
+    /// Parses a canonical UUID upload ID.
+    ///
+    /// Returns an error for non-UUID values or UUID strings that are not in the
+    /// canonical hyphenated lowercase form.
+    pub fn parse(value: impl Into<String>) -> Result<Self, DomainError> {
+        let value = value.into();
+        let Ok(uuid) = uuid::Uuid::parse_str(&value) else {
+            return Err(DomainError::InvalidUploadId);
+        };
+        if uuid.to_string() != value {
+            return Err(DomainError::InvalidUploadId);
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the upload ID as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for UploadId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for UploadId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for UploadId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(value).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Parsed HTTP Content-Length value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct ContentLength(u64);
@@ -249,6 +302,132 @@ impl<'de> Deserialize<'de> for PartNumber {
     }
 }
 
+/// Implemented S3 operation selected by method, target shape, and query string.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum S3Operation {
+    /// PutObject.
+    PutObject,
+    /// CreateMultipartUpload.
+    CreateMultipartUpload,
+    /// UploadPart.
+    UploadPart {
+        /// Multipart upload ID.
+        upload_id: UploadId,
+        /// Multipart part number.
+        part_number: PartNumber,
+    },
+    /// CompleteMultipartUpload.
+    CompleteMultipartUpload {
+        /// Multipart upload ID.
+        upload_id: UploadId,
+    },
+    /// AbortMultipartUpload.
+    AbortMultipartUpload {
+        /// Multipart upload ID.
+        upload_id: UploadId,
+    },
+    /// ListParts.
+    ListParts {
+        /// Multipart upload ID.
+        upload_id: UploadId,
+    },
+    /// HeadBucket.
+    HeadBucket,
+    /// HeadObject.
+    HeadObject,
+    /// GetObject.
+    GetObject,
+    /// DeleteObject.
+    DeleteObject,
+}
+
+impl S3Operation {
+    /// Returns the S3 operation name used for tracing and diagnostics.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::PutObject => "PutObject",
+            Self::CreateMultipartUpload => "CreateMultipartUpload",
+            Self::UploadPart { .. } => "UploadPart",
+            Self::CompleteMultipartUpload { .. } => "CompleteMultipartUpload",
+            Self::AbortMultipartUpload { .. } => "AbortMultipartUpload",
+            Self::ListParts { .. } => "ListParts",
+            Self::HeadBucket => "HeadBucket",
+            Self::HeadObject => "HeadObject",
+            Self::GetObject => "GetObject",
+            Self::DeleteObject => "DeleteObject",
+        }
+    }
+}
+
+/// Parsed `x-amz-content-sha256` payload hash mode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PayloadHashMode {
+    /// Header is absent.
+    Missing,
+    /// Literal `UNSIGNED-PAYLOAD`.
+    UnsignedPayload,
+    /// Fixed lowercase SHA256 hex digest.
+    FixedSha256 {
+        /// Original lowercase hex value.
+        hex: String,
+        /// Decoded digest bytes.
+        digest: Vec<u8>,
+    },
+    /// Literal `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`.
+    StreamingSignedPayload,
+    /// Literal `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`.
+    StreamingSignedPayloadTrailer,
+    /// Literal `STREAMING-UNSIGNED-PAYLOAD-TRAILER`.
+    StreamingUnsignedPayloadTrailer,
+}
+
+impl PayloadHashMode {
+    /// Parses a payload hash header value.
+    ///
+    /// Returns an error when the value is not one of the S3 payload hash modes
+    /// implemented by this endpoint.
+    pub fn parse(value: Option<&str>) -> Result<Self, DomainError> {
+        let Some(value) = value else {
+            return Ok(Self::Missing);
+        };
+        match value {
+            "UNSIGNED-PAYLOAD" => Ok(Self::UnsignedPayload),
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" => Ok(Self::StreamingSignedPayload),
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER" => Ok(Self::StreamingSignedPayloadTrailer),
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER" => Ok(Self::StreamingUnsignedPayloadTrailer),
+            _ if is_lowercase_sha256_hex(value) => {
+                let digest = hex::decode(value).map_err(|_| DomainError::InvalidPayloadHashMode)?;
+                Ok(Self::FixedSha256 {
+                    hex: value.to_owned(),
+                    digest,
+                })
+            }
+            _ => Err(DomainError::InvalidPayloadHashMode),
+        }
+    }
+
+    /// Returns the literal value used in SigV4 canonical requests, if present.
+    pub fn canonical_value(&self) -> Option<&str> {
+        match self {
+            Self::Missing => None,
+            Self::UnsignedPayload => Some("UNSIGNED-PAYLOAD"),
+            Self::FixedSha256 { hex, .. } => Some(hex),
+            Self::StreamingSignedPayload => Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD"),
+            Self::StreamingSignedPayloadTrailer => {
+                Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER")
+            }
+            Self::StreamingUnsignedPayloadTrailer => Some("STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
+        }
+    }
+}
+
+fn is_lowercase_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// Resolved object request target.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct S3Target {
@@ -294,6 +473,14 @@ pub enum DomainError {
     /// Request ID was empty or contained control characters.
     #[error("request ID contains invalid characters")]
     InvalidRequestId,
+
+    /// Upload ID was not a canonical lowercase UUID.
+    #[error("upload ID must be a canonical lowercase UUID")]
+    InvalidUploadId,
+
+    /// Payload hash mode was not supported.
+    #[error("payload hash mode is invalid")]
+    InvalidPayloadHashMode,
 }
 
 #[cfg(test)]
@@ -343,6 +530,35 @@ mod tests {
     }
 
     #[test]
+    fn upload_id_accepts_canonical_uuid() {
+        let upload_id = UploadId::new();
+
+        assert_eq!(
+            UploadId::parse(upload_id.as_str()).expect("upload id"),
+            upload_id
+        );
+    }
+
+    #[test]
+    fn upload_id_rejects_non_uuid_or_non_canonical_values() {
+        assert!(matches!(
+            UploadId::parse("../outside"),
+            Err(DomainError::InvalidUploadId)
+        ));
+        assert!(matches!(
+            UploadId::parse("550E8400-E29B-41D4-A716-446655440000"),
+            Err(DomainError::InvalidUploadId)
+        ));
+    }
+
+    #[test]
+    fn upload_id_deserialization_uses_same_validation() {
+        let result = serde_json::from_str::<UploadId>(r#""../outside""#);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn etag_rejects_empty_and_control_characters() {
         assert_eq!(ETag::parse("\"abc\"").expect("etag").as_str(), "\"abc\"");
         assert!(matches!(ETag::parse(""), Err(DomainError::InvalidETag)));
@@ -363,6 +579,49 @@ mod tests {
         assert!(matches!(
             ContentLength::from_str("not-an-int"),
             Err(DomainError::InvalidContentLength)
+        ));
+    }
+
+    #[test]
+    fn payload_hash_mode_parses_supported_values() {
+        let digest = "0".repeat(64);
+        assert!(matches!(
+            PayloadHashMode::parse(None).expect("missing"),
+            PayloadHashMode::Missing
+        ));
+        assert!(matches!(
+            PayloadHashMode::parse(Some("UNSIGNED-PAYLOAD")).expect("unsigned"),
+            PayloadHashMode::UnsignedPayload
+        ));
+        assert!(matches!(
+            PayloadHashMode::parse(Some(&digest)).expect("fixed"),
+            PayloadHashMode::FixedSha256 { .. }
+        ));
+        assert!(matches!(
+            PayloadHashMode::parse(Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD")).expect("streaming"),
+            PayloadHashMode::StreamingSignedPayload
+        ));
+        assert!(matches!(
+            PayloadHashMode::parse(Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"))
+                .expect("streaming trailer"),
+            PayloadHashMode::StreamingSignedPayloadTrailer
+        ));
+        assert!(matches!(
+            PayloadHashMode::parse(Some("STREAMING-UNSIGNED-PAYLOAD-TRAILER"))
+                .expect("unsigned trailer"),
+            PayloadHashMode::StreamingUnsignedPayloadTrailer
+        ));
+    }
+
+    #[test]
+    fn payload_hash_mode_rejects_unsupported_or_non_lowercase_values() {
+        assert!(matches!(
+            PayloadHashMode::parse(Some(&"A".repeat(64))),
+            Err(DomainError::InvalidPayloadHashMode)
+        ));
+        assert!(matches!(
+            PayloadHashMode::parse(Some("not-supported")),
+            Err(DomainError::InvalidPayloadHashMode)
         ));
     }
 }

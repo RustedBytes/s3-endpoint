@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
+    body::upload::payload_hash_mode,
     config::{AccessKeyId, AuthState, S3Action},
     error::S3Error,
     s3::types::BucketName,
@@ -275,8 +276,13 @@ fn canonical_request(
     validate_singleton_auth_headers(headers)?;
     let canonical_headers = canonical_headers(headers, &signed_header_names)?;
     let payload_hash = match payload_hash_source {
-        PayloadHashSource::Header => header_str(headers, "x-amz-content-sha256")?,
-        PayloadHashSource::UnsignedPayload => "UNSIGNED-PAYLOAD",
+        PayloadHashSource::Header => {
+            let mode = payload_hash_mode(headers).map_err(|_| AuthError::InvalidPayloadHashMode)?;
+            mode.canonical_value()
+                .ok_or_else(|| AuthError::MissingSignedHeader("x-amz-content-sha256".to_owned()))?
+                .to_owned()
+        }
+        PayloadHashSource::UnsignedPayload => "UNSIGNED-PAYLOAD".to_owned(),
     };
 
     Ok(format!(
@@ -755,6 +761,9 @@ enum AuthError {
 
     #[error("invalid signed header value for {0}")]
     InvalidHeaderValue(String),
+
+    #[error("unsupported x-amz-content-sha256 payload mode")]
+    InvalidPayloadHashMode,
 
     #[error("{0} must not appear more than once")]
     DuplicateHeader(String),

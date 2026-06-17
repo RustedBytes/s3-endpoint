@@ -23,9 +23,9 @@ use crate::{
     },
     s3::{
         target::resolve_s3_target,
-        types::{ETag, PartNumber, RequestId},
+        types::{ETag, PartNumber, RequestId, UploadId},
     },
-    storage::{CompletedPart, StoreError, UploadId, UploadSession},
+    storage::{CompletedPart, StoreError, UploadSession},
 };
 
 const COMPLETE_MULTIPART_XML_LIMIT: usize = 8 * 1024 * 1024;
@@ -85,13 +85,10 @@ pub(crate) async fn upload_part(
     state: AppState,
     request: Request<Body>,
     request_id: &RequestId,
+    upload_id: UploadId,
+    part_number: PartNumber,
 ) -> Result<Response, S3Error> {
     let auth_context = authenticate_request(&state, &request)?;
-    let query = request.uri().query().unwrap_or_default();
-    let upload_id = parse_upload_id(query)?;
-    let part_number = unique_query_param(query, "partNumber")?
-        .ok_or_else(|| S3Error::invalid_request("partNumber is required"))
-        .and_then(parse_part_number_query)?;
     validate_supported_request_body_length(request.headers())?;
     validate_upload_headers(request.headers())?;
     let headers = request.headers().clone();
@@ -175,10 +172,10 @@ pub(crate) async fn list_parts(
     state: AppState,
     request: Request<Body>,
     request_id: &RequestId,
+    upload_id: UploadId,
 ) -> Result<Response, S3Error> {
     let auth_context = authenticate_request(&state, &request)?;
     let query = request.uri().query().unwrap_or_default();
-    let upload_id = parse_upload_id(query)?;
     let page = ListPartsPageRequest::parse(query)?;
     let session = validate_upload_session_target(&state, &request, &auth_context, &upload_id)?;
     auth::authorize(
@@ -278,10 +275,10 @@ pub(crate) async fn abort_multipart_upload(
     state: AppState,
     request: Request<Body>,
     request_id: &RequestId,
+    upload_id: UploadId,
 ) -> Result<Response, S3Error> {
     let auth_context = authenticate_request(&state, &request)?;
     validate_empty_request_body_headers(request.headers(), "AbortMultipartUpload")?;
-    let upload_id = parse_upload_id(request.uri().query().unwrap_or_default())?;
     let session = validate_upload_session_target(&state, &request, &auth_context, &upload_id)?;
     auth::authorize(
         &state.auth,
@@ -309,12 +306,11 @@ pub(crate) async fn complete_multipart_upload(
     state: AppState,
     request: Request<Body>,
     request_id: &RequestId,
+    upload_id: UploadId,
 ) -> Result<Response, S3Error> {
     let auth_context = authenticate_request(&state, &request)?;
     let headers = request.headers().clone();
     let location = completion_location(&request);
-    let query = request.uri().query().unwrap_or_default().to_owned();
-    let upload_id = parse_upload_id(&query)?;
     let session = validate_upload_session_target(&state, &request, &auth_context, &upload_id)?;
     auth::authorize(
         &state.auth,
@@ -394,20 +390,6 @@ fn authenticate_request(
         request.uri(),
         request.headers(),
     )
-}
-
-fn parse_upload_id(query: &str) -> Result<UploadId, S3Error> {
-    let value = unique_query_param(query, "uploadId")?
-        .ok_or_else(|| S3Error::invalid_request("uploadId is required"))?;
-    UploadId::parse(value).map_err(|err| S3Error::invalid_request(err.to_string()))
-}
-
-fn parse_part_number_query(value: String) -> Result<PartNumber, S3Error> {
-    let value = value
-        .parse::<u16>()
-        .map_err(|_| S3Error::invalid_request("partNumber must be an integer"))?;
-    PartNumber::parse(value)
-        .map_err(|_| S3Error::invalid_request("partNumber must be in 1..=10000"))
 }
 
 fn validate_upload_session_target(

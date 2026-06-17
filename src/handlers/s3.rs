@@ -13,20 +13,22 @@ use crate::{
     error::S3Error,
     s3::{
         target::{has_virtual_hosted_bucket, resolve_s3_target},
-        types::{PartNumber, RequestId},
+        types::{PartNumber, RequestId, S3Operation, UploadId},
     },
 };
 
 pub async fn handle_s3_request(State(state): State<AppState>, request: Request<Body>) -> Response {
     let method = request.method().clone();
     let query = request.uri().query().unwrap_or_default().to_owned();
-    let operation = checked_operation_name(
+    let detected_operation = detect_operation(
         &request,
         state.config.virtual_host_base_domain.as_deref(),
-        &method,
         &query,
-    )
-    .unwrap_or("InvalidRequest");
+    );
+    let operation = detected_operation
+        .as_ref()
+        .map(DetectedOperation::name)
+        .unwrap_or("InvalidRequest");
     let mut log_context = request_log_context(
         &request,
         state.config.virtual_host_base_domain.as_deref(),
@@ -41,7 +43,7 @@ pub async fn handle_s3_request(State(state): State<AppState>, request: Request<B
     let started_at = Instant::now();
 
     let response = match state.try_acquire_s3_request() {
-        Ok(_permit) => match dispatch(state, request, &method, &query, &request_id).await {
+        Ok(_permit) => match dispatch(state, request, detected_operation, &request_id).await {
             Ok(response) => response,
             Err(error) => error.into_response_with_request_id(&request_id),
         },
@@ -128,15 +130,97 @@ fn request_log_context(
 async fn dispatch(
     state: AppState,
     request: Request<Body>,
-    method: &Method,
-    query: &str,
+    detected_operation: Result<DetectedOperation, S3Error>,
     request_id: &RequestId,
 ) -> Result<Response, S3Error> {
-    if method == Method::HEAD {
-        if has_object_route(&request, state.config.virtual_host_base_domain.as_deref()) {
+    match detected_operation? {
+        DetectedOperation::Implemented(S3Operation::HeadObject) => {
             return crate::handlers::head_object::head_object(state, request, request_id).await;
         }
-        return crate::handlers::head_bucket::head_bucket(state, request, request_id).await;
+        DetectedOperation::Implemented(S3Operation::HeadBucket) => {
+            return crate::handlers::head_bucket::head_bucket(state, request, request_id).await;
+        }
+        DetectedOperation::Implemented(S3Operation::CreateMultipartUpload) => {
+            return crate::handlers::multipart::create_multipart_upload(state, request, request_id)
+                .await;
+        }
+        DetectedOperation::Implemented(S3Operation::UploadPart {
+            upload_id,
+            part_number,
+        }) => {
+            return crate::handlers::multipart::upload_part(
+                state,
+                request,
+                request_id,
+                upload_id,
+                part_number,
+            )
+            .await;
+        }
+        DetectedOperation::Implemented(S3Operation::PutObject) => {
+            return crate::handlers::put_object::handle_put_object(state, request, request_id)
+                .await;
+        }
+        DetectedOperation::Implemented(S3Operation::CompleteMultipartUpload { upload_id }) => {
+            return crate::handlers::multipart::complete_multipart_upload(
+                state, request, request_id, upload_id,
+            )
+            .await;
+        }
+        DetectedOperation::Implemented(S3Operation::AbortMultipartUpload { upload_id }) => {
+            return crate::handlers::multipart::abort_multipart_upload(
+                state, request, request_id, upload_id,
+            )
+            .await;
+        }
+        DetectedOperation::Implemented(S3Operation::DeleteObject) => {
+            return crate::handlers::delete_object::delete_object(state, request, request_id).await;
+        }
+        DetectedOperation::Implemented(S3Operation::ListParts { upload_id }) => {
+            return crate::handlers::multipart::list_parts(state, request, request_id, upload_id)
+                .await;
+        }
+        DetectedOperation::Implemented(S3Operation::GetObject) => {
+            return crate::handlers::get_object::get_object(state, request, request_id).await;
+        }
+        DetectedOperation::ListObjectsV2 => {
+            Err(S3Error::not_implemented("ListObjectsV2 is not implemented"))
+        }
+        DetectedOperation::Unsupported => Err(S3Error::invalid_argument("list-type must be 2")),
+        DetectedOperation::MethodNotAllowed => Err(S3Error::method_not_allowed()),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DetectedOperation {
+    Implemented(S3Operation),
+    ListObjectsV2,
+    Unsupported,
+    MethodNotAllowed,
+}
+
+impl DetectedOperation {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Implemented(operation) => operation.name(),
+            Self::ListObjectsV2 => "ListObjectsV2",
+            Self::Unsupported => "Unsupported",
+            Self::MethodNotAllowed => "MethodNotAllowed",
+        }
+    }
+}
+
+fn detect_operation(
+    request: &Request<Body>,
+    virtual_host_base_domain: Option<&str>,
+    query: &str,
+) -> Result<DetectedOperation, S3Error> {
+    let method = request.method();
+    if method == Method::HEAD {
+        if has_object_route(request, virtual_host_base_domain) {
+            return Ok(DetectedOperation::Implemented(S3Operation::HeadObject));
+        }
+        return Ok(DetectedOperation::Implemented(S3Operation::HeadBucket));
     }
 
     if method == Method::POST {
@@ -148,121 +232,92 @@ async fn dispatch(
             ));
         }
         if has_uploads {
-            return crate::handlers::multipart::create_multipart_upload(state, request, request_id)
-                .await;
+            return Ok(DetectedOperation::Implemented(
+                S3Operation::CreateMultipartUpload,
+            ));
+        }
+        if let Some(upload_id) = upload_id {
+            return Ok(DetectedOperation::Implemented(
+                S3Operation::CompleteMultipartUpload {
+                    upload_id: parse_upload_id_value(upload_id)?,
+                },
+            ));
         }
     }
 
-    let has_part_number = unique_query_param(query, "partNumber")?.is_some();
-    let has_upload_id = unique_query_param(query, "uploadId")?.is_some();
+    let part_number = unique_query_param(query, "partNumber")?;
+    let upload_id = unique_query_param(query, "uploadId")?;
 
-    if method == Method::PUT && has_upload_id && !has_part_number {
+    if method == Method::PUT && upload_id.is_some() && part_number.is_none() {
         return Err(S3Error::invalid_request("partNumber is required"));
     }
 
-    if method == Method::PUT && has_part_number && !has_upload_id {
+    if method == Method::PUT && part_number.is_some() && upload_id.is_none() {
         return Err(S3Error::invalid_request("uploadId is required"));
     }
 
-    if method == Method::PUT && has_part_number {
-        return crate::handlers::multipart::upload_part(state, request, request_id).await;
+    if method == Method::PUT
+        && let Some(part_number) = part_number
+    {
+        return Ok(DetectedOperation::Implemented(S3Operation::UploadPart {
+            upload_id: parse_upload_id_value(upload_id.expect("checked uploadId"))?,
+            part_number: parse_part_number_value(part_number)?,
+        }));
     }
 
     if method == Method::PUT {
-        return crate::handlers::put_object::handle_put_object(state, request, request_id).await;
+        return Ok(DetectedOperation::Implemented(S3Operation::PutObject));
     }
-
-    if method == Method::POST && unique_query_param(query, "uploadId")?.is_some() {
-        return crate::handlers::multipart::complete_multipart_upload(state, request, request_id)
-            .await;
-    }
-
-    if method == Method::DELETE && unique_query_param(query, "uploadId")?.is_some() {
-        return crate::handlers::multipart::abort_multipart_upload(state, request, request_id)
-            .await;
-    }
-
     if method == Method::DELETE
-        && has_object_route(&request, state.config.virtual_host_base_domain.as_deref())
+        && let Some(upload_id) = upload_id
     {
-        return crate::handlers::delete_object::delete_object(state, request, request_id).await;
-    }
-
-    if method == Method::GET && unique_query_param(query, "uploadId")?.is_some() {
-        return crate::handlers::multipart::list_parts(state, request, request_id).await;
-    }
-
-    if method == Method::GET
-        && let Some(list_type) = unique_query_param(query, "list-type")?
-    {
-        if list_type == "2" {
-            return Err(S3Error::not_implemented("ListObjectsV2 is not implemented"));
-        }
-        return Err(S3Error::invalid_argument("list-type must be 2"));
-    }
-
-    if method == Method::GET
-        && has_object_route(&request, state.config.virtual_host_base_domain.as_deref())
-    {
-        return crate::handlers::get_object::get_object(state, request, request_id).await;
-    }
-
-    Err(S3Error::method_not_allowed())
-}
-
-fn checked_operation_name(
-    request: &Request<Body>,
-    virtual_host_base_domain: Option<&str>,
-    method: &Method,
-    query: &str,
-) -> Result<&'static str, S3Error> {
-    if method == Method::HEAD {
-        if has_object_route(request, virtual_host_base_domain) {
-            return Ok("HeadObject");
-        }
-        return Ok("HeadBucket");
-    }
-
-    if method == Method::POST && unique_query_flag(query, "uploads")? {
-        return Ok("CreateMultipartUpload");
-    }
-    if method == Method::PUT && unique_query_param(query, "partNumber")?.is_some() {
-        return Ok("UploadPart");
-    }
-    if method == Method::PUT {
-        return Ok("PutObject");
-    }
-    if method == Method::POST && unique_query_param(query, "uploadId")?.is_some() {
-        return Ok("CompleteMultipartUpload");
-    }
-    if method == Method::DELETE && unique_query_param(query, "uploadId")?.is_some() {
-        return Ok("AbortMultipartUpload");
+        return Ok(DetectedOperation::Implemented(
+            S3Operation::AbortMultipartUpload {
+                upload_id: parse_upload_id_value(upload_id)?,
+            },
+        ));
     }
     if method == Method::DELETE {
         if has_object_route(request, virtual_host_base_domain) {
-            return Ok("DeleteObject");
+            return Ok(DetectedOperation::Implemented(S3Operation::DeleteObject));
         }
-        return Ok("Unsupported");
+        return Ok(DetectedOperation::MethodNotAllowed);
     }
-    if method == Method::GET && unique_query_param(query, "uploadId")?.is_some() {
-        return Ok("ListParts");
+    if method == Method::GET
+        && let Some(upload_id) = upload_id
+    {
+        return Ok(DetectedOperation::Implemented(S3Operation::ListParts {
+            upload_id: parse_upload_id_value(upload_id)?,
+        }));
     }
     if method == Method::GET
         && let Some(list_type) = unique_query_param(query, "list-type")?
     {
         if list_type == "2" {
-            return Ok("ListObjectsV2");
+            return Ok(DetectedOperation::ListObjectsV2);
         }
-        return Ok("Unsupported");
+        return Ok(DetectedOperation::Unsupported);
     }
     if method == Method::GET {
         if has_object_route(request, virtual_host_base_domain) {
-            return Ok("GetObject");
+            return Ok(DetectedOperation::Implemented(S3Operation::GetObject));
         }
-        return Ok("Unsupported");
+        return Ok(DetectedOperation::MethodNotAllowed);
     }
 
-    Ok("MethodNotAllowed")
+    Ok(DetectedOperation::MethodNotAllowed)
+}
+
+fn parse_upload_id_value(value: String) -> Result<UploadId, S3Error> {
+    UploadId::parse(value).map_err(|_| S3Error::invalid_request("invalid upload ID"))
+}
+
+fn parse_part_number_value(value: String) -> Result<PartNumber, S3Error> {
+    let value = value
+        .parse::<u16>()
+        .map_err(|_| S3Error::invalid_request("partNumber must be an integer"))?;
+    PartNumber::parse(value)
+        .map_err(|_| S3Error::invalid_request("partNumber must be in 1..=10000"))
 }
 
 fn has_object_route(request: &Request<Body>, virtual_host_base_domain: Option<&str>) -> bool {
@@ -413,92 +468,138 @@ mod tests {
     }
 
     #[test]
-    fn checked_operation_name_uses_checked_query_decoding() {
+    fn detect_operation_parses_upload_part() {
+        let upload_id = UploadId::new();
         let request = Request::builder()
             .method(Method::PUT)
-            .uri("/test-bucket/object.txt?partNumber=1&uploadId=upload-123")
+            .uri(format!(
+                "/test-bucket/object.txt?partNumber=1&uploadId={upload_id}"
+            ))
             .body(Body::empty())
             .expect("request");
 
-        let operation = checked_operation_name(
-            &request,
-            None,
-            request.method(),
-            request.uri().query().expect("query"),
-        )
-        .expect("operation");
+        let operation = detect_operation(&request, None, request.uri().query().expect("query"))
+            .expect("operation");
 
-        assert_eq!(operation, "UploadPart");
+        assert_eq!(
+            operation,
+            DetectedOperation::Implemented(S3Operation::UploadPart {
+                upload_id,
+                part_number: PartNumber::parse(1).expect("part number")
+            })
+        );
     }
 
     #[test]
-    fn checked_operation_name_reports_list_objects_v2() {
+    fn detect_operation_reports_list_objects_v2() {
         let request = Request::builder()
             .method(Method::GET)
             .uri("/test-bucket?list-type=2")
             .body(Body::empty())
             .expect("request");
 
-        let operation = checked_operation_name(
-            &request,
-            None,
-            request.method(),
-            request.uri().query().expect("query"),
-        )
-        .expect("operation");
+        let operation = detect_operation(&request, None, request.uri().query().expect("query"))
+            .expect("operation");
 
-        assert_eq!(operation, "ListObjectsV2");
+        assert_eq!(operation, DetectedOperation::ListObjectsV2);
     }
 
     #[test]
-    fn checked_operation_name_does_not_report_invalid_list_type_as_v2() {
+    fn detect_operation_does_not_report_invalid_list_type_as_v2() {
         let request = Request::builder()
             .method(Method::GET)
             .uri("/test-bucket?list-type=1")
             .body(Body::empty())
             .expect("request");
 
-        let operation = checked_operation_name(
-            &request,
-            None,
-            request.method(),
-            request.uri().query().expect("query"),
-        )
-        .expect("operation");
+        let operation = detect_operation(&request, None, request.uri().query().expect("query"))
+            .expect("operation");
 
-        assert_eq!(operation, "Unsupported");
+        assert_eq!(operation, DetectedOperation::Unsupported);
     }
 
     #[test]
-    fn checked_operation_name_reports_object_operation_for_invalid_object_key() {
+    fn detect_operation_reports_object_operation_for_invalid_object_key() {
         let request = Request::builder()
             .method(Method::GET)
             .uri("/test-bucket/bad%0Akey.txt")
             .body(Body::empty())
             .expect("request");
 
-        let operation =
-            checked_operation_name(&request, None, request.method(), "").expect("operation");
+        let operation = detect_operation(&request, None, "").expect("operation");
 
-        assert_eq!(operation, "GetObject");
+        assert_eq!(
+            operation,
+            DetectedOperation::Implemented(S3Operation::GetObject)
+        );
     }
 
     #[test]
-    fn checked_operation_name_rejects_invalid_query_utf8() {
+    fn detect_operation_rejects_invalid_query_utf8() {
         let request = Request::builder()
             .method(Method::GET)
             .uri("/test-bucket/object.txt?upload%FFId=upload-123")
             .body(Body::empty())
             .expect("request");
 
-        let result = checked_operation_name(
-            &request,
-            None,
-            request.method(),
-            request.uri().query().expect("query"),
-        );
+        let result = detect_operation(&request, None, request.uri().query().expect("query"));
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn detect_operation_rejects_ambiguous_multipart_queries() {
+        let upload_id = UploadId::new();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!(
+                "/test-bucket/object.txt?uploads&uploadId={upload_id}"
+            ))
+            .body(Body::empty())
+            .expect("request");
+
+        let result = detect_operation(&request, None, request.uri().query().expect("query"));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn detect_operation_rejects_duplicate_multipart_query_params() {
+        let upload_id = UploadId::new();
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri(format!(
+                "/test-bucket/object.txt?partNumber=1&partNumber=2&uploadId={upload_id}"
+            ))
+            .body(Body::empty())
+            .expect("request");
+
+        let result = detect_operation(&request, None, request.uri().query().expect("query"));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn detect_operation_requires_upload_id_and_part_number_together() {
+        let upload_id = UploadId::new();
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/test-bucket/object.txt?uploadId={upload_id}"))
+            .body(Body::empty())
+            .expect("request");
+
+        let missing_part = detect_operation(&request, None, request.uri().query().expect("query"));
+        assert!(missing_part.is_err());
+
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/test-bucket/object.txt?partNumber=1")
+            .body(Body::empty())
+            .expect("request");
+
+        let missing_upload_id =
+            detect_operation(&request, None, request.uri().query().expect("query"));
+        assert!(missing_upload_id.is_err());
     }
 
     #[test]

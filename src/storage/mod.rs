@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use crc::{CRC_32_ISCSI, CRC_32_ISO_HDLC, Crc};
 use dashmap::DashMap;
 use md5::{Digest as Md5Digest, Md5};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Sha256, Sha512};
 use thiserror::Error;
@@ -24,6 +24,8 @@ use crate::{
     error::S3Error,
     s3::types::{BucketName, ETag, ObjectKey, PartNumber},
 };
+
+pub use crate::s3::types::UploadId;
 
 static CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
 static CRC32C: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
@@ -421,53 +423,6 @@ impl FileObjectStore {
             }
         }
         Ok(())
-    }
-}
-
-/// Multipart upload identifier.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
-pub struct UploadId(String);
-
-impl UploadId {
-    /// Creates a new random upload ID.
-    pub fn new() -> Self {
-        Self(Uuid::new_v4().to_string())
-    }
-
-    /// Parses a canonical UUID upload ID.
-    ///
-    /// Returns an error for non-UUID values or UUID strings that are not in the
-    /// canonical hyphenated lowercase form.
-    pub fn parse(value: impl Into<String>) -> Result<Self, StoreError> {
-        let value = value.into();
-        let Ok(uuid) = Uuid::parse_str(&value) else {
-            return Err(StoreError::InvalidUploadId);
-        };
-        if uuid.to_string() != value {
-            return Err(StoreError::InvalidUploadId);
-        }
-        Ok(Self(value))
-    }
-
-    /// Returns the upload ID as a string slice.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Default for UploadId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<'de> Deserialize<'de> for UploadId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::parse(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -1237,37 +1192,6 @@ mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
     use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-
-    #[test]
-    fn upload_id_accepts_canonical_uuid() {
-        let upload_id = UploadId::new();
-
-        assert_eq!(
-            UploadId::parse(upload_id.as_str()).expect("upload id"),
-            upload_id
-        );
-    }
-
-    #[test]
-    fn upload_id_rejects_non_uuid_path_segments() {
-        assert!(matches!(
-            UploadId::parse("../outside"),
-            Err(StoreError::InvalidUploadId)
-        ));
-        assert!(matches!(
-            UploadId::parse("550E8400-E29B-41D4-A716-446655440000"),
-            Err(StoreError::InvalidUploadId)
-        ));
-    }
-
-    #[test]
-    fn upload_id_deserialization_uses_same_validation() {
-        let json = r#""../outside""#;
-
-        let result = serde_json::from_str::<UploadId>(json);
-
-        assert!(result.is_err());
-    }
 
     #[test]
     fn upload_session_deserialization_defaults_missing_state_to_open() {

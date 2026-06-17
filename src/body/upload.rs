@@ -16,14 +16,10 @@ use crate::{
     auth::StreamingSigningContext,
     body::checksum::{ChecksumDigests, ChecksumRequest},
     error::S3Error,
-    s3::types::ContentLength,
+    s3::types::{ContentLength, PayloadHashMode},
 };
 
 const MAX_AWS_CHUNKED_CONTROL_LINE_BYTES: usize = 16 * 1024;
-const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
-const SIGNED_AWS_CHUNKED_PAYLOAD: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
-const SIGNED_AWS_CHUNKED_PAYLOAD_TRAILER: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER";
-const UNSIGNED_AWS_CHUNKED_PAYLOAD_TRAILER: &str = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
 static CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
 static CRC32C: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
 
@@ -116,28 +112,32 @@ where
     })
 }
 
-fn validate_payload_hash_mode(headers: &HeaderMap) -> Result<(), S3Error> {
-    let Some(value) = optional_singleton_header(headers, "x-amz-content-sha256")?
+pub(crate) fn payload_hash_mode(headers: &HeaderMap) -> Result<PayloadHashMode, S3Error> {
+    let value = optional_singleton_header(headers, "x-amz-content-sha256")?
         .map(|value| value.to_str())
         .transpose()
-        .map_err(|_| S3Error::invalid_request("x-amz-content-sha256 must be valid ASCII"))?
-    else {
-        return Ok(());
-    };
+        .map_err(|_| S3Error::invalid_request("x-amz-content-sha256 must be valid ASCII"))?;
 
+    PayloadHashMode::parse(value)
+        .map_err(|_| S3Error::invalid_request("Unsupported x-amz-content-sha256 payload mode"))
+}
+
+fn validate_payload_hash_mode(headers: &HeaderMap) -> Result<(), S3Error> {
+    let mode = payload_hash_mode(headers)?;
     if is_aws_chunked_request(headers) {
-        match value {
-            SIGNED_AWS_CHUNKED_PAYLOAD
-            | SIGNED_AWS_CHUNKED_PAYLOAD_TRAILER
-            | UNSIGNED_AWS_CHUNKED_PAYLOAD_TRAILER => Ok(()),
+        match mode {
+            PayloadHashMode::StreamingSignedPayload
+            | PayloadHashMode::StreamingSignedPayloadTrailer
+            | PayloadHashMode::StreamingUnsignedPayloadTrailer => Ok(()),
             _ => Err(S3Error::invalid_request(
                 "Unsupported x-amz-content-sha256 payload mode for aws-chunked upload",
             )),
         }
     } else {
-        match value {
-            UNSIGNED_PAYLOAD => Ok(()),
-            _ if is_lowercase_sha256_hex(value) => Ok(()),
+        match mode {
+            PayloadHashMode::Missing
+            | PayloadHashMode::UnsignedPayload
+            | PayloadHashMode::FixedSha256 { .. } => Ok(()),
             _ => Err(S3Error::invalid_request(
                 "Unsupported x-amz-content-sha256 payload mode",
             )),
@@ -153,65 +153,40 @@ pub(crate) fn validate_actual_sha256_payload_hash(
         return Ok(());
     }
 
-    let Some(value) = optional_singleton_header(headers, "x-amz-content-sha256")?
-        .map(|value| value.to_str())
-        .transpose()
-        .map_err(|_| S3Error::invalid_request("x-amz-content-sha256 must be valid ASCII"))?
-    else {
-        return Ok(());
-    };
-
-    if value == UNSIGNED_PAYLOAD {
-        return Ok(());
+    match payload_hash_mode(headers)? {
+        PayloadHashMode::Missing | PayloadHashMode::UnsignedPayload => Ok(()),
+        PayloadHashMode::FixedSha256 { digest, .. } => {
+            if digest.as_slice() != actual_digest {
+                return Err(S3Error::bad_digest(
+                    "The provided x-amz-content-sha256 header does not match what was computed.",
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(S3Error::invalid_request(
+            "Unsupported x-amz-content-sha256 payload mode",
+        )),
     }
-
-    let expected = hex::decode(value)
-        .map_err(|_| S3Error::invalid_request("x-amz-content-sha256 must be SHA256 hex"))?;
-    if expected.as_slice() != actual_digest {
-        return Err(S3Error::bad_digest(
-            "The provided x-amz-content-sha256 header does not match what was computed.",
-        ));
-    }
-    Ok(())
 }
 
 pub(crate) fn validate_fixed_sha256_payload_hash(
     headers: &HeaderMap,
     actual_digest: &[u8],
 ) -> Result<(), S3Error> {
-    let Some(value) = optional_singleton_header(headers, "x-amz-content-sha256")?
-        .map(|value| value.to_str())
-        .transpose()
-        .map_err(|_| S3Error::invalid_request("x-amz-content-sha256 must be valid ASCII"))?
-    else {
-        return Ok(());
-    };
-
-    if value == UNSIGNED_PAYLOAD {
-        return Ok(());
-    }
-
-    if !is_lowercase_sha256_hex(value) {
-        return Err(S3Error::invalid_request(
+    match payload_hash_mode(headers)? {
+        PayloadHashMode::Missing | PayloadHashMode::UnsignedPayload => Ok(()),
+        PayloadHashMode::FixedSha256 { digest, .. } => {
+            if digest.as_slice() != actual_digest {
+                return Err(S3Error::bad_digest(
+                    "The provided x-amz-content-sha256 header does not match what was computed.",
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(S3Error::invalid_request(
             "Unsupported x-amz-content-sha256 payload mode",
-        ));
+        )),
     }
-
-    let expected = hex::decode(value)
-        .map_err(|_| S3Error::invalid_request("x-amz-content-sha256 must be SHA256 hex"))?;
-    if expected.as_slice() != actual_digest {
-        return Err(S3Error::bad_digest(
-            "The provided x-amz-content-sha256 header does not match what was computed.",
-        ));
-    }
-    Ok(())
-}
-
-fn is_lowercase_sha256_hex(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 async fn write_aws_chunked_upload_body<W>(
@@ -374,10 +349,10 @@ fn requires_actual_sha256_payload_hash(headers: &HeaderMap) -> bool {
     if is_aws_chunked_request(headers) {
         return false;
     }
-    headers
-        .get("x-amz-content-sha256")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(is_lowercase_sha256_hex)
+    matches!(
+        payload_hash_mode(headers),
+        Ok(PayloadHashMode::FixedSha256 { .. })
+    )
 }
 
 fn checksum_header_or_declared_trailer(headers: &HeaderMap, name: &str) -> bool {
@@ -606,13 +581,9 @@ fn streaming_signature_verifier(
     headers: &HeaderMap,
     streaming_signing: Option<&StreamingSigningContext>,
 ) -> Result<Option<AwsChunkSignatureVerifier>, S3Error> {
-    let payload_hash = headers
-        .get("x-amz-content-sha256")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    let mode = match payload_hash {
-        SIGNED_AWS_CHUNKED_PAYLOAD => StreamingSignatureMode::Payload,
-        SIGNED_AWS_CHUNKED_PAYLOAD_TRAILER => StreamingSignatureMode::PayloadTrailer,
+    let mode = match payload_hash_mode(headers)? {
+        PayloadHashMode::StreamingSignedPayload => StreamingSignatureMode::Payload,
+        PayloadHashMode::StreamingSignedPayloadTrailer => StreamingSignatureMode::PayloadTrailer,
         _ => return Ok(None),
     };
 
@@ -867,5 +838,85 @@ mod tests {
         let state = UploadBodyState::new(&headers);
 
         assert!(state.sha256.is_some());
+    }
+
+    #[test]
+    fn payload_hash_mode_from_headers_accepts_supported_modes() {
+        let cases = [
+            ("UNSIGNED-PAYLOAD", PayloadHashMode::UnsignedPayload),
+            (
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+                PayloadHashMode::StreamingSignedPayload,
+            ),
+            (
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+                PayloadHashMode::StreamingSignedPayloadTrailer,
+            ),
+            (
+                "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+                PayloadHashMode::StreamingUnsignedPayloadTrailer,
+            ),
+        ];
+
+        for (value, expected) in cases {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-amz-content-sha256", HeaderValue::from_static(value));
+
+            assert_eq!(payload_hash_mode(&headers).expect("payload mode"), expected);
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-amz-content-sha256",
+            HeaderValue::from_str(&"0".repeat(64)).expect("header"),
+        );
+        assert!(matches!(
+            payload_hash_mode(&headers).expect("fixed sha256"),
+            PayloadHashMode::FixedSha256 { .. }
+        ));
+    }
+
+    #[test]
+    fn payload_hash_mode_from_headers_accepts_missing_header() {
+        let headers = HeaderMap::new();
+
+        assert_eq!(
+            payload_hash_mode(&headers).expect("payload mode"),
+            PayloadHashMode::Missing
+        );
+    }
+
+    #[test]
+    fn payload_hash_mode_from_headers_rejects_invalid_values() {
+        for value in ["not-supported".to_owned(), "A".repeat(64)] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-amz-content-sha256",
+                HeaderValue::from_str(&value).expect("header"),
+            );
+
+            let error = payload_hash_mode(&headers).expect_err("invalid payload mode");
+
+            assert!(format!("{error:?}").contains("Unsupported x-amz-content-sha256 payload mode"));
+        }
+    }
+
+    #[test]
+    fn payload_hash_mode_from_headers_rejects_duplicate_header() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "x-amz-content-sha256",
+            HeaderValue::from_static("UNSIGNED-PAYLOAD"),
+        );
+        headers.append(
+            "x-amz-content-sha256",
+            HeaderValue::from_static("UNSIGNED-PAYLOAD"),
+        );
+
+        let error = payload_hash_mode(&headers).expect_err("duplicate payload hash");
+
+        assert!(
+            format!("{error:?}").contains("x-amz-content-sha256 must not appear more than once")
+        );
     }
 }
