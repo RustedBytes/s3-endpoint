@@ -5,7 +5,9 @@ pub mod head_object;
 pub mod health;
 pub mod multipart;
 pub mod put_object;
+pub mod request;
 pub mod s3;
+pub mod upload_metadata;
 
 use axum::http::{HeaderMap, header};
 

@@ -20,20 +20,17 @@ use crate::{
 pub async fn handle_s3_request(State(state): State<AppState>, request: Request<Body>) -> Response {
     let method = request.method().clone();
     let query = request.uri().query().unwrap_or_default().to_owned();
-    let detected_operation = detect_operation(
+    let parsed_request = ParsedS3Request::parse(
         &request,
         state.config.virtual_host_base_domain.as_deref(),
         &query,
     );
-    let operation = detected_operation
+    let operation = parsed_request
+        .operation
         .as_ref()
         .map(DetectedOperation::name)
         .unwrap_or("InvalidRequest");
-    let mut log_context = request_log_context(
-        &request,
-        state.config.virtual_host_base_domain.as_deref(),
-        &query,
-    );
+    let mut log_context = parsed_request.log_context;
     let content_length = request
         .headers()
         .get(header::CONTENT_LENGTH)
@@ -43,10 +40,12 @@ pub async fn handle_s3_request(State(state): State<AppState>, request: Request<B
     let started_at = Instant::now();
 
     let response = match state.try_acquire_s3_request() {
-        Ok(_permit) => match dispatch(state, request, detected_operation, &request_id).await {
-            Ok(response) => response,
-            Err(error) => error.into_response_with_request_id(&request_id),
-        },
+        Ok(_permit) => {
+            match dispatch(state, request, parsed_request.operation, &request_id).await {
+                Ok(response) => response,
+                Err(error) => error.into_response_with_request_id(&request_id),
+            }
+        }
         Err(error) => error.into_response_with_request_id(&request_id),
     };
     let response = if method == Method::HEAD {
@@ -71,6 +70,21 @@ pub async fn handle_s3_request(State(state): State<AppState>, request: Request<B
         "s3 request completed"
     );
     response
+}
+
+#[derive(Debug)]
+struct ParsedS3Request {
+    operation: Result<DetectedOperation, S3Error>,
+    log_context: RequestLogContext,
+}
+
+impl ParsedS3Request {
+    fn parse(request: &Request<Body>, virtual_host_base_domain: Option<&str>, query: &str) -> Self {
+        Self {
+            operation: detect_operation(request, virtual_host_base_domain, query),
+            log_context: request_log_context(request, virtual_host_base_domain, query),
+        }
+    }
 }
 
 fn without_head_response_body(mut response: Response) -> Response {

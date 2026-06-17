@@ -4,7 +4,6 @@ use axum::{
     response::Response,
 };
 use futures_util::stream;
-use sha2::Digest as Sha2Digest;
 use std::io::SeekFrom;
 use tokio::{
     fs::File,
@@ -12,12 +11,14 @@ use tokio::{
 };
 
 use crate::{
-    AppState, auth,
-    body::upload::validate_fixed_sha256_payload_hash,
+    AppState,
     config::S3Action,
     error::S3Error,
-    handlers::s3::unique_query_param,
-    s3::{target::resolve_s3_target, types::RequestId},
+    handlers::{
+        request::{authenticate_and_authorize_target, validate_empty_payload_hash},
+        s3::unique_query_param,
+    },
+    s3::types::RequestId,
 };
 
 pub(crate) async fn get_object(
@@ -25,30 +26,8 @@ pub(crate) async fn get_object(
     request: Request<Body>,
     request_id: &RequestId,
 ) -> Result<Response, S3Error> {
-    let auth_context = auth::authenticate(
-        &state.auth,
-        request.method(),
-        request.uri(),
-        request.headers(),
-    )?;
-    let path = request.uri().path().to_owned();
-    let target = resolve_s3_target(
-        &path,
-        request
-            .headers()
-            .get(header::HOST)
-            .and_then(|value| value.to_str().ok()),
-        state.config.virtual_host_base_domain.as_deref(),
-    )
-    .map_err(|err| S3Error::invalid_request(err.to_string()).with_resource(path))?;
-    auth::authorize(
-        &state.auth,
-        &auth_context,
-        &target.bucket,
-        S3Action::GetObject,
-    )?;
-    let empty_payload_digest = sha2::Sha256::digest([]);
-    validate_fixed_sha256_payload_hash(request.headers(), empty_payload_digest.as_ref())?;
+    let (_, target) = authenticate_and_authorize_target(&state, &request, S3Action::GetObject)?;
+    validate_empty_payload_hash(&request)?;
 
     let (metadata, mut file) = state
         .object_store

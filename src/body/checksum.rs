@@ -5,28 +5,89 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 
 use crate::error::S3Error;
 
-const SUPPORTED_CHECKSUM_HEADERS: &[&str] = &[
-    "x-amz-checksum-crc32",
-    "x-amz-checksum-crc32c",
-    "x-amz-checksum-sha1",
-    "x-amz-checksum-sha256",
-    "x-amz-checksum-sha512",
-];
 const UNSUPPORTED_CHECKSUM_HEADERS: &[&str] = &[
     "x-amz-checksum-crc64nvme",
     "x-amz-checksum-xxhash64",
     "x-amz-checksum-xxhash3",
     "x-amz-checksum-xxhash128",
 ];
-const CHECKSUM_HEADERS: &[&str] = &[
-    "content-md5",
-    "x-amz-checksum-crc32",
-    "x-amz-checksum-crc32c",
-    "x-amz-checksum-sha1",
-    "x-amz-checksum-sha256",
-    "x-amz-checksum-sha512",
-];
+const CHECKSUM_HEADERS: &[&str] = &["content-md5"];
 const SDK_CHECKSUM_ALGORITHM_HEADER: &str = "x-amz-sdk-checksum-algorithm";
+const CHECKSUM_NAMES: &[ChecksumName] = &[
+    ChecksumName::Crc32,
+    ChecksumName::Crc32c,
+    ChecksumName::Sha1,
+    ChecksumName::Sha256,
+    ChecksumName::Sha512,
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChecksumName {
+    Crc32,
+    Crc32c,
+    Sha1,
+    Sha256,
+    Sha512,
+}
+
+impl ChecksumName {
+    pub(crate) fn header_name(self) -> &'static str {
+        match self {
+            Self::Crc32 => "x-amz-checksum-crc32",
+            Self::Crc32c => "x-amz-checksum-crc32c",
+            Self::Sha1 => "x-amz-checksum-sha1",
+            Self::Sha256 => "x-amz-checksum-sha256",
+            Self::Sha512 => "x-amz-checksum-sha512",
+        }
+    }
+
+    pub(crate) fn xml_element_name(self) -> &'static str {
+        match self {
+            Self::Crc32 => "ChecksumCRC32",
+            Self::Crc32c => "ChecksumCRC32C",
+            Self::Sha1 => "ChecksumSHA1",
+            Self::Sha256 => "ChecksumSHA256",
+            Self::Sha512 => "ChecksumSHA512",
+        }
+    }
+
+    fn expected_len(self) -> usize {
+        match self {
+            Self::Crc32 | Self::Crc32c => 4,
+            Self::Sha1 => 20,
+            Self::Sha256 => 32,
+            Self::Sha512 => 64,
+        }
+    }
+
+    pub(crate) fn from_header_name(name: &str) -> Option<Self> {
+        CHECKSUM_NAMES
+            .iter()
+            .copied()
+            .find(|checksum| checksum.header_name() == name)
+    }
+
+    fn from_sdk_algorithm(algorithm: &str) -> Option<Self> {
+        match algorithm.to_ascii_uppercase().as_str() {
+            "CRC32" => Some(Self::Crc32),
+            "CRC32C" => Some(Self::Crc32c),
+            "SHA1" => Some(Self::Sha1),
+            "SHA256" => Some(Self::Sha256),
+            "SHA512" => Some(Self::Sha512),
+            _ => None,
+        }
+    }
+
+    fn encode_digest(self, digests: &ChecksumDigests) -> String {
+        match self {
+            Self::Crc32 => BASE64.encode(digests.crc32.to_be_bytes()),
+            Self::Crc32c => BASE64.encode(digests.crc32c.to_be_bytes()),
+            Self::Sha1 => BASE64.encode(&digests.sha1),
+            Self::Sha256 => BASE64.encode(&digests.sha256),
+            Self::Sha512 => BASE64.encode(&digests.sha512),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ChecksumRequest {
@@ -52,14 +113,11 @@ impl ChecksumRequest {
         reject_duplicate_checksum_inputs(headers, trailers)?;
         validate_declared_checksum_trailers(headers, trailers)?;
         let content_md5 = optional_base64_header(headers, trailers, "content-md5", 16)?;
-        let checksum_crc32 = optional_base64_header(headers, trailers, "x-amz-checksum-crc32", 4)?;
-        let checksum_crc32c =
-            optional_base64_header(headers, trailers, "x-amz-checksum-crc32c", 4)?;
-        let checksum_sha1 = optional_base64_header(headers, trailers, "x-amz-checksum-sha1", 20)?;
-        let checksum_sha256 =
-            optional_base64_header(headers, trailers, "x-amz-checksum-sha256", 32)?;
-        let checksum_sha512 =
-            optional_base64_header(headers, trailers, "x-amz-checksum-sha512", 64)?;
+        let checksum_crc32 = optional_checksum(headers, trailers, ChecksumName::Crc32)?;
+        let checksum_crc32c = optional_checksum(headers, trailers, ChecksumName::Crc32c)?;
+        let checksum_sha1 = optional_checksum(headers, trailers, ChecksumName::Sha1)?;
+        let checksum_sha256 = optional_checksum(headers, trailers, ChecksumName::Sha256)?;
+        let checksum_sha512 = optional_checksum(headers, trailers, ChecksumName::Sha512)?;
         let checksum_values = checksum_values(headers, trailers)?;
         validate_sdk_checksum_algorithm(headers, trailers)?;
         Ok(Self {
@@ -136,32 +194,32 @@ impl ChecksumRequest {
         let mut values = BTreeMap::new();
         if self.checksum_crc32.is_some() {
             values.insert(
-                "x-amz-checksum-crc32".to_owned(),
-                BASE64.encode(digests.crc32.to_be_bytes()),
+                ChecksumName::Crc32.header_name().to_owned(),
+                ChecksumName::Crc32.encode_digest(digests),
             );
         }
         if self.checksum_crc32c.is_some() {
             values.insert(
-                "x-amz-checksum-crc32c".to_owned(),
-                BASE64.encode(digests.crc32c.to_be_bytes()),
+                ChecksumName::Crc32c.header_name().to_owned(),
+                ChecksumName::Crc32c.encode_digest(digests),
             );
         }
         if self.checksum_sha1.is_some() {
             values.insert(
-                "x-amz-checksum-sha1".to_owned(),
-                BASE64.encode(&digests.sha1),
+                ChecksumName::Sha1.header_name().to_owned(),
+                ChecksumName::Sha1.encode_digest(digests),
             );
         }
         if self.checksum_sha256.is_some() {
             values.insert(
-                "x-amz-checksum-sha256".to_owned(),
-                BASE64.encode(&digests.sha256),
+                ChecksumName::Sha256.header_name().to_owned(),
+                ChecksumName::Sha256.encode_digest(digests),
             );
         }
         if self.checksum_sha512.is_some() {
             values.insert(
-                "x-amz-checksum-sha512".to_owned(),
-                BASE64.encode(&digests.sha512),
+                ChecksumName::Sha512.header_name().to_owned(),
+                ChecksumName::Sha512.encode_digest(digests),
             );
         }
         values
@@ -209,14 +267,7 @@ pub(crate) fn checksum_values_for_requested_headers(
     requested
         .keys()
         .filter_map(|name| {
-            let value = match name.as_str() {
-                "x-amz-checksum-crc32" => BASE64.encode(digests.crc32.to_be_bytes()),
-                "x-amz-checksum-crc32c" => BASE64.encode(digests.crc32c.to_be_bytes()),
-                "x-amz-checksum-sha1" => BASE64.encode(&digests.sha1),
-                "x-amz-checksum-sha256" => BASE64.encode(&digests.sha256),
-                "x-amz-checksum-sha512" => BASE64.encode(&digests.sha512),
-                _ => return None,
-            };
+            let value = ChecksumName::from_header_name(name)?.encode_digest(digests);
             Some((name.clone(), value))
         })
         .collect()
@@ -226,10 +277,11 @@ fn checksum_values(
     headers: &HeaderMap,
     trailers: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>, S3Error> {
-    SUPPORTED_CHECKSUM_HEADERS
+    CHECKSUM_NAMES
         .iter()
         .copied()
-        .filter_map(|name| {
+        .filter_map(|checksum| {
+            let name = checksum.header_name();
             let value =
                 if let Some(value) = headers.get(name) {
                     Some(value.to_str().map_err(|_| {
@@ -241,6 +293,19 @@ fn checksum_values(
             Some(value.map(|value| (name.to_owned(), value.to_owned())))
         })
         .collect()
+}
+
+fn optional_checksum(
+    headers: &HeaderMap,
+    trailers: &BTreeMap<String, String>,
+    checksum: ChecksumName,
+) -> Result<Option<Vec<u8>>, S3Error> {
+    optional_base64_header(
+        headers,
+        trailers,
+        checksum.header_name(),
+        checksum.expected_len(),
+    )
 }
 
 fn optional_base64_header(
@@ -289,16 +354,9 @@ fn validate_sdk_checksum_algorithm(
         ))
     })?;
 
-    let checksum_header_name = match algorithm.to_ascii_uppercase().as_str() {
-        "CRC32" => "x-amz-checksum-crc32",
-        "CRC32C" => "x-amz-checksum-crc32c",
-        "SHA1" => "x-amz-checksum-sha1",
-        "SHA256" => "x-amz-checksum-sha256",
-        "SHA512" => "x-amz-checksum-sha512",
-        _ => {
-            return Err(S3Error::invalid_request("Checksum algorithm not supported"));
-        }
-    };
+    let checksum_header_name = ChecksumName::from_sdk_algorithm(algorithm)
+        .ok_or_else(|| S3Error::invalid_request("Checksum algorithm not supported"))?
+        .header_name();
 
     if headers.get(checksum_header_name).is_none() && !trailers.contains_key(checksum_header_name) {
         return Err(S3Error::invalid_request(format!(
@@ -326,16 +384,21 @@ fn reject_duplicate_checksum_inputs(
     headers: &HeaderMap,
     trailers: &BTreeMap<String, String>,
 ) -> Result<(), S3Error> {
-    for name in CHECKSUM_HEADERS {
-        if headers.get_all(*name).iter().count() > 1 {
+    for name in CHECKSUM_HEADERS
+        .iter()
+        .copied()
+        .chain(CHECKSUM_NAMES.iter().map(|checksum| checksum.header_name()))
+    {
+        if headers.get_all(name).iter().count() > 1 {
             return Err(S3Error::invalid_request(format!(
                 "{name} must not appear more than once"
             )));
         }
     }
 
-    for name in SUPPORTED_CHECKSUM_HEADERS {
-        if headers.contains_key(*name) && trailers.contains_key(*name) {
+    for checksum in CHECKSUM_NAMES {
+        let name = checksum.header_name();
+        if headers.contains_key(name) && trailers.contains_key(name) {
             return Err(S3Error::invalid_request(format!(
                 "{name} must not be supplied as both header and trailer"
             )));
@@ -378,7 +441,7 @@ fn validate_declared_checksum_trailers(
         if UNSUPPORTED_CHECKSUM_HEADERS.contains(&declared_name.as_str()) {
             return Err(S3Error::invalid_request("Checksum algorithm not supported"));
         }
-        if !SUPPORTED_CHECKSUM_HEADERS.contains(&declared_name.as_str()) {
+        if ChecksumName::from_header_name(&declared_name).is_none() {
             return Err(S3Error::invalid_request(format!(
                 "x-amz-trailer contains unsupported trailer name: {declared_name}"
             )));
@@ -397,8 +460,9 @@ fn reject_undeclared_checksum_trailers(
     declared_names: &BTreeSet<String>,
     trailers: &BTreeMap<String, String>,
 ) -> Result<(), S3Error> {
-    for name in SUPPORTED_CHECKSUM_HEADERS {
-        if trailers.contains_key(*name) && !declared_names.contains(*name) {
+    for checksum in CHECKSUM_NAMES {
+        let name = checksum.header_name();
+        if trailers.contains_key(name) && !declared_names.contains(name) {
             return Err(S3Error::invalid_request(format!(
                 "Checksum trailer was not declared: {name}"
             )));

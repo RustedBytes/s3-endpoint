@@ -104,6 +104,12 @@ curl -i http://127.0.0.1:9000/health
 
 Empty `allowed_buckets` or `allowed_actions` means the credential is unrestricted for that dimension.
 
+## Storage Durability
+
+The filesystem store publishes object bytes, metadata, multipart parts, and upload session files with temporary files plus atomic renames where the platform supports them. Failed commits use best-effort rollback and startup cleanup removes stale temporary files and orphaned object/metadata pairs.
+
+The current store does not fsync object files or parent directories before acknowledging writes. It is intended for local-compatible S3 workflows where process crashes and ordinary I/O failures are handled, but crash-consistent durability across sudden power loss is delegated to the underlying filesystem and host configuration.
+
 ## AWS CLI Example
 
 ```bash

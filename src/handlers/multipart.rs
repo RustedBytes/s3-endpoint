@@ -11,20 +11,22 @@ use tokio::io::AsyncWriteExt;
 use crate::{
     AppState, auth,
     body::{
-        checksum::ChecksumRequest,
+        checksum::{ChecksumName, ChecksumRequest},
         upload::{validate_fixed_sha256_payload_hash, write_upload_body},
     },
     config::S3Action,
     error::S3Error,
+    handlers::put_object::validate_upload_headers,
     handlers::{
-        put_object::{collect_upload_metadata, validate_upload_headers},
+        request::{
+            authenticate_request, authorize_request, resolve_request_target,
+            validate_empty_payload_hash,
+        },
         s3::unique_query_param,
+        upload_metadata::collect_upload_metadata,
         validate_empty_request_body_headers, validate_supported_request_body_length,
     },
-    s3::{
-        target::resolve_s3_target,
-        types::{ETag, PartNumber, RequestId, UploadId},
-    },
+    s3::types::{ETag, PartNumber, RequestId, UploadId},
     storage::{CompletedPart, StoreError, UploadProcessing, UploadSession},
 };
 
@@ -38,20 +40,10 @@ pub(crate) async fn create_multipart_upload(
     let auth_context = authenticate_request(&state, &request)?;
     validate_empty_request_body_headers(request.headers(), "CreateMultipartUpload")?;
     validate_upload_headers(request.headers())?;
-    let empty_payload_digest = sha2::Sha256::digest([]);
-    validate_fixed_sha256_payload_hash(request.headers(), empty_payload_digest.as_ref())?;
-    let path = request.uri().path().to_owned();
-    let target = resolve_s3_target(
-        &path,
-        request
-            .headers()
-            .get(header::HOST)
-            .and_then(|value| value.to_str().ok()),
-        state.config.virtual_host_base_domain.as_deref(),
-    )
-    .map_err(|err| S3Error::invalid_request(err.to_string()).with_resource(path))?;
-    auth::authorize(
-        &state.auth,
+    validate_empty_payload_hash(&request)?;
+    let target = resolve_request_target(&state, &request)?;
+    authorize_request(
+        &state,
         &auth_context,
         &target.bucket,
         S3Action::CreateMultipartUpload,
@@ -93,12 +85,7 @@ pub(crate) async fn upload_part(
     validate_upload_headers(request.headers())?;
     let headers = request.headers().clone();
     let session = validate_upload_session_target(&state, &request, &auth_context, &upload_id)?;
-    auth::authorize(
-        &state.auth,
-        &auth_context,
-        &session.bucket,
-        S3Action::UploadPart,
-    )?;
+    authorize_request(&state, &auth_context, &session.bucket, S3Action::UploadPart)?;
 
     let _part_writer_permit = state.try_acquire_multipart_part_writer()?;
     let _aws_chunked_decoder_permit = state.try_acquire_aws_chunked_decoder(&headers)?;
@@ -178,14 +165,13 @@ pub(crate) async fn list_parts(
     let query = request.uri().query().unwrap_or_default();
     let page = ListPartsPageRequest::parse(query)?;
     let session = validate_upload_session_target(&state, &request, &auth_context, &upload_id)?;
-    auth::authorize(
-        &state.auth,
+    authorize_request(
+        &state,
         &auth_context,
         &session.bucket,
         S3Action::ListMultipartUploadParts,
     )?;
-    let empty_payload_digest = sha2::Sha256::digest([]);
-    validate_fixed_sha256_payload_hash(request.headers(), empty_payload_digest.as_ref())?;
+    validate_empty_payload_hash(&request)?;
 
     let matching_parts: Vec<_> = session
         .parts
@@ -261,14 +247,7 @@ pub(crate) async fn list_parts(
 }
 
 fn checksum_xml_element_name(header_name: &str) -> Option<&'static str> {
-    match header_name {
-        "x-amz-checksum-crc32" => Some("ChecksumCRC32"),
-        "x-amz-checksum-crc32c" => Some("ChecksumCRC32C"),
-        "x-amz-checksum-sha1" => Some("ChecksumSHA1"),
-        "x-amz-checksum-sha256" => Some("ChecksumSHA256"),
-        "x-amz-checksum-sha512" => Some("ChecksumSHA512"),
-        _ => None,
-    }
+    ChecksumName::from_header_name(header_name).map(ChecksumName::xml_element_name)
 }
 
 pub(crate) async fn abort_multipart_upload(
@@ -280,14 +259,13 @@ pub(crate) async fn abort_multipart_upload(
     let auth_context = authenticate_request(&state, &request)?;
     validate_empty_request_body_headers(request.headers(), "AbortMultipartUpload")?;
     let session = validate_upload_session_target(&state, &request, &auth_context, &upload_id)?;
-    auth::authorize(
-        &state.auth,
+    authorize_request(
+        &state,
         &auth_context,
         &session.bucket,
         S3Action::AbortMultipartUpload,
     )?;
-    let empty_payload_digest = sha2::Sha256::digest([]);
-    validate_fixed_sha256_payload_hash(request.headers(), empty_payload_digest.as_ref())?;
+    validate_empty_payload_hash(&request)?;
     state
         .multipart_store
         .abort_upload(&upload_id)
@@ -312,8 +290,8 @@ pub(crate) async fn complete_multipart_upload(
     let headers = request.headers().clone();
     let location = completion_location(&request);
     let session = validate_upload_session_target(&state, &request, &auth_context, &upload_id)?;
-    auth::authorize(
-        &state.auth,
+    authorize_request(
+        &state,
         &auth_context,
         &session.bucket,
         S3Action::CompleteMultipartUpload,
@@ -384,18 +362,6 @@ pub(crate) async fn complete_multipart_upload(
     ))
 }
 
-fn authenticate_request(
-    state: &AppState,
-    request: &Request<Body>,
-) -> Result<auth::AuthContext, S3Error> {
-    auth::authenticate(
-        &state.auth,
-        request.method(),
-        request.uri(),
-        request.headers(),
-    )
-}
-
 fn validate_upload_session_target(
     state: &AppState,
     request: &Request<Body>,
@@ -409,16 +375,7 @@ fn validate_upload_session_target(
     if !session.is_open() {
         return Err(S3Error::no_such_upload());
     }
-    let path = request.uri().path().to_owned();
-    let target = resolve_s3_target(
-        &path,
-        request
-            .headers()
-            .get(header::HOST)
-            .and_then(|value| value.to_str().ok()),
-        state.config.virtual_host_base_domain.as_deref(),
-    )
-    .map_err(|err| S3Error::invalid_request(err.to_string()).with_resource(path))?;
+    let target = resolve_request_target(state, request)?;
 
     if target.bucket != session.bucket || target.key != session.key {
         return Err(S3Error::no_such_upload());
