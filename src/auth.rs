@@ -354,7 +354,31 @@ fn validate_singleton_auth_headers(headers: &HeaderMap) -> Result<(), AuthError>
 }
 
 fn canonical_uri(path: &str) -> String {
-    aws_uri_encode(path.as_bytes(), true)
+    let bytes = path.as_bytes();
+    let mut encoded = String::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                encoded.push(bytes[index] as char)
+            }
+            b'%' if index + 2 < bytes.len()
+                && bytes[index + 1].is_ascii_hexdigit()
+                && bytes[index + 2].is_ascii_hexdigit() =>
+            {
+                encoded.push('%');
+                encoded.push((bytes[index + 1] as char).to_ascii_uppercase());
+                encoded.push((bytes[index + 2] as char).to_ascii_uppercase());
+                index += 3;
+                continue;
+            }
+            byte => encoded.push_str(&format!("%{byte:02X}")),
+        }
+        index += 1;
+    }
+
+    encoded
 }
 
 fn canonical_query(query: &str, mode: CanonicalQueryMode) -> Result<String, AuthError> {
@@ -828,6 +852,22 @@ mod tests {
             )
             .expect("query"),
             "x-id=PutObject"
+        );
+    }
+
+    #[test]
+    fn canonical_uri_preserves_existing_percent_encoded_octets() {
+        assert_eq!(
+            canonical_uri("/bucket/IMG_4161%202.JPG/%e2%9c%93/%25.txt"),
+            "/bucket/IMG_4161%202.JPG/%E2%9C%93/%25.txt"
+        );
+    }
+
+    #[test]
+    fn canonical_uri_encodes_literal_unsafe_bytes() {
+        assert_eq!(
+            canonical_uri("/bucket/space key/✓.txt"),
+            "/bucket/space%20key/%E2%9C%93.txt"
         );
     }
 

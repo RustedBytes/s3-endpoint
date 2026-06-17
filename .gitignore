@@ -1,4 +1,6 @@
+/my_local_folder
 /target
+/data
 .venv*/
 node_modules/
 tests/sdk/java-smoke/target/

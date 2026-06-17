@@ -2990,6 +2990,64 @@ async fn put_object_accepts_valid_header_sigv4() {
 }
 
 #[tokio::test]
+async fn put_object_accepts_header_sigv4_with_percent_encoded_space_key() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let state = AppState::new(Config {
+        storage_root: temp_dir.path().to_path_buf(),
+        auth: permissive_auth_config(),
+        virtual_host_base_domain: None,
+        upload_limits: Default::default(),
+    })
+    .await
+    .expect("create app state");
+    let path = "/test-bucket/IMG_4161%202.JPG";
+    let amz_date = "20260616T120000Z";
+    let payload_hash = "UNSIGNED-PAYLOAD";
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+    let authorization = authorization_header(SignatureInput {
+        method: "PUT",
+        path,
+        host: "localhost:9000",
+        amz_date,
+        payload_hash,
+        signed_headers,
+        access_key: "test",
+        secret_key: "testsecret",
+        region: "us-east-1",
+        session_token: None,
+        extra_signed_headers: &[],
+    });
+
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(path)
+                .header(header::HOST, "localhost:9000")
+                .header(header::CONTENT_LENGTH, "6")
+                .header("x-amz-date", amz_date)
+                .header("x-amz-content-sha256", payload_hash)
+                .header(header::AUTHORIZATION, authorization)
+                .body(Body::from("signed"))
+                .expect("build request"),
+        )
+        .await
+        .expect("send request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let metadata = state
+        .object_store
+        .head_object(
+            &BucketName::parse("test-bucket").expect("bucket"),
+            &ObjectKey::parse("IMG_4161 2.JPG").expect("key"),
+        )
+        .await
+        .expect("read metadata");
+    assert!(metadata.is_some());
+}
+
+#[tokio::test]
 async fn put_object_rejects_header_sigv4_with_malformed_signature() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let state = AppState::new(Config {
