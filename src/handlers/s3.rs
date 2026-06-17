@@ -11,7 +11,11 @@ use std::time::Instant;
 use crate::{
     AppState,
     error::S3Error,
-    hooks::{OperationContext, S3ErrorContext, S3RequestContext, S3ResponseContext},
+    handlers::request::authenticate_request,
+    hooks::{
+        OperationContext, S3ErrorContext, S3RequestContext, S3ResponseContext, TenantId,
+        TenantLimitContext, TenantOperationOutcome,
+    },
     s3::{
         target::{has_virtual_hosted_bucket, resolve_bucket_name, resolve_s3_target},
         types::{BucketName, ObjectKey, PartNumber, RequestId, S3Operation, UploadId},
@@ -59,6 +63,9 @@ pub async fn handle_s3_request(State(state): State<AppState>, request: Request<B
                 request,
                 parsed_request.operation,
                 &request_id,
+                method.clone(),
+                log_context.clone(),
+                content_length,
             )
             .await
             {
@@ -198,6 +205,9 @@ async fn dispatch(
     request: Request<Body>,
     detected_operation: Result<DetectedOperation, S3Error>,
     request_id: &RequestId,
+    method: Method,
+    log_context: RequestLogContext,
+    content_length: Option<u64>,
 ) -> Result<Response, S3Error> {
     match detected_operation? {
         DetectedOperation::Implemented(operation) => {
@@ -205,7 +215,29 @@ async fn dispatch(
                 action: operation.action(),
                 operation: operation.clone(),
             })?;
-            dispatch_implemented_operation(state, request, operation, request_id).await
+            let auth_context = authenticate_request(&state, &request).await?;
+            let tenant_context = TenantLimitContext {
+                request_id: request_id.clone(),
+                tenant: TenantId::from(&auth_context.principal),
+                principal: auth_context.principal.clone(),
+                method,
+                action: operation.action(),
+                operation: operation.clone(),
+                bucket: log_context.bucket,
+                key: log_context.key,
+                upload_id: log_context.upload_id,
+                part_number: log_context.part_number,
+                content_length,
+            };
+            dispatch_tenant_limited_operation(
+                state,
+                request,
+                operation,
+                request_id,
+                auth_context,
+                tenant_context,
+            )
+            .await
         }
         DetectedOperation::ListObjectsV2 => {
             Err(S3Error::not_implemented("ListObjectsV2 is not implemented"))
@@ -220,17 +252,35 @@ async fn dispatch_implemented_operation(
     request: Request<Body>,
     operation: S3Operation,
     request_id: &RequestId,
+    auth_context: crate::auth::AuthContext,
 ) -> Result<Response, S3Error> {
     match operation {
         S3Operation::HeadObject => {
-            return crate::handlers::head_object::head_object(state, request, request_id).await;
+            return crate::handlers::head_object::head_object(
+                state,
+                request,
+                request_id,
+                auth_context,
+            )
+            .await;
         }
         S3Operation::HeadBucket => {
-            return crate::handlers::head_bucket::head_bucket(state, request, request_id).await;
+            return crate::handlers::head_bucket::head_bucket(
+                state,
+                request,
+                request_id,
+                auth_context,
+            )
+            .await;
         }
         S3Operation::CreateMultipartUpload => {
-            return crate::handlers::multipart::create_multipart_upload(state, request, request_id)
-                .await;
+            return crate::handlers::multipart::create_multipart_upload(
+                state,
+                request,
+                request_id,
+                auth_context,
+            )
+            .await;
         }
         S3Operation::UploadPart {
             upload_id,
@@ -242,36 +292,110 @@ async fn dispatch_implemented_operation(
                 request_id,
                 upload_id,
                 part_number,
+                auth_context,
             )
             .await;
         }
         S3Operation::PutObject => {
-            return crate::handlers::put_object::handle_put_object(state, request, request_id)
-                .await;
+            return crate::handlers::put_object::handle_put_object(
+                state,
+                request,
+                request_id,
+                auth_context,
+            )
+            .await;
         }
         S3Operation::CompleteMultipartUpload { upload_id } => {
             return crate::handlers::multipart::complete_multipart_upload(
-                state, request, request_id, upload_id,
+                state,
+                request,
+                request_id,
+                upload_id,
+                auth_context,
             )
             .await;
         }
         S3Operation::AbortMultipartUpload { upload_id } => {
             return crate::handlers::multipart::abort_multipart_upload(
-                state, request, request_id, upload_id,
+                state,
+                request,
+                request_id,
+                upload_id,
+                auth_context,
             )
             .await;
         }
         S3Operation::DeleteObject => {
-            return crate::handlers::delete_object::delete_object(state, request, request_id).await;
+            return crate::handlers::delete_object::delete_object(
+                state,
+                request,
+                request_id,
+                auth_context,
+            )
+            .await;
         }
         S3Operation::ListParts { upload_id } => {
-            return crate::handlers::multipart::list_parts(state, request, request_id, upload_id)
-                .await;
+            return crate::handlers::multipart::list_parts(
+                state,
+                request,
+                request_id,
+                upload_id,
+                auth_context,
+            )
+            .await;
         }
         S3Operation::GetObject => {
-            return crate::handlers::get_object::get_object(state, request, request_id).await;
+            return crate::handlers::get_object::get_object(
+                state,
+                request,
+                request_id,
+                auth_context,
+            )
+            .await;
         }
     }
+}
+
+async fn dispatch_tenant_limited_operation(
+    state: AppState,
+    request: Request<Body>,
+    operation: S3Operation,
+    request_id: &RequestId,
+    auth_context: crate::auth::AuthContext,
+    tenant_context: TenantLimitContext,
+) -> Result<Response, S3Error> {
+    let lease = state.begin_tenant_operation(tenant_context.clone()).await?;
+    let timeout = lease.timeout_duration();
+    let operation_future =
+        dispatch_implemented_operation(state.clone(), request, operation, request_id, auth_context);
+    let result = if let Some(timeout) = timeout {
+        match tokio::time::timeout(timeout, operation_future).await {
+            Ok(result) => result,
+            Err(_) => {
+                let error = S3Error::slow_down("operation timed out");
+                let outcome = TenantOperationOutcome::timed_out(&error);
+                state.finish_tenant_operation(tenant_context, outcome).await;
+                drop(lease);
+                return Err(error);
+            }
+        }
+    } else {
+        operation_future.await
+    };
+
+    let outcome = match &result {
+        Ok(response) => TenantOperationOutcome::success(
+            response.status(),
+            response
+                .extensions()
+                .get::<DecodedBodyBytes>()
+                .map(|bytes| bytes.0),
+        ),
+        Err(error) => TenantOperationOutcome::error(error, None),
+    };
+    state.finish_tenant_operation(tenant_context, outcome).await;
+    drop(lease);
+    result
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

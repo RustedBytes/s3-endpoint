@@ -6,7 +6,7 @@ use axum::{
 };
 
 use crate::{
-    AppState,
+    AppState, auth,
     body::{
         checksum::checksum_values_for_requested_headers,
         upload::{summarize_staged_upload, write_upload_body},
@@ -14,7 +14,7 @@ use crate::{
     config::S3Action,
     error::S3Error,
     handlers::{
-        request::{authenticate_request, authorize_request, resolve_request_target},
+        request::{authorize_request, resolve_request_target},
         upload_metadata::collect_upload_metadata,
         validate_supported_request_body_length,
     },
@@ -31,6 +31,7 @@ pub(crate) async fn handle_put_object(
     state: AppState,
     request: Request<Body>,
     request_id: &RequestId,
+    auth_context: auth::AuthContext,
 ) -> Result<Response, S3Error> {
     let path = request.uri().path().to_owned();
     let target = resolve_request_target(&state, &request)?;
@@ -38,7 +39,6 @@ pub(crate) async fn handle_put_object(
     let headers = request.headers().clone();
     validate_supported_request_body_length(&headers).map_err(|error| error.with_resource(path))?;
     validate_upload_headers(&headers)?;
-    let auth_context = authenticate_request(&state, &request).await?;
     authorize_request(
         &state,
         &auth_context,

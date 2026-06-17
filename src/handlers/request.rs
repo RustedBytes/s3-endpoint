@@ -100,28 +100,6 @@ pub(crate) fn authorize_request(
     })
 }
 
-pub(crate) fn authenticate_and_authorize_target(
-    state: &AppState,
-    request: &Request<Body>,
-    action: S3Action,
-) -> impl Future<Output = Result<(auth::AuthContext, S3Target), S3Error>> + Send + 'static {
-    let auth = authenticate_request(state, request);
-    let target = resolve_request_target(state, request);
-    let state = state.clone();
-    async move {
-        let auth_context = auth.await?;
-        let target = target?;
-        authorize_request(
-            &state,
-            &auth_context,
-            &target.bucket,
-            Some(&target.key),
-            action,
-        )?;
-        Ok((auth_context, target))
-    }
-}
-
 pub(crate) fn validate_empty_payload_hash(request: &Request<Body>) -> Result<(), S3Error> {
     let empty_payload_digest = sha2::Sha256::digest([]);
     validate_fixed_sha256_payload_hash(request.headers(), empty_payload_digest.as_ref())

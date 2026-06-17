@@ -146,6 +146,16 @@ The embedded API exposes several additive controls:
 - `multipart_lifecycle` controls startup cleanup and incomplete upload expiry.
 - `object_store` and `multipart_store` replace the default filesystem stores
   with implementations of the public storage traits.
+- `tenant_limits_provider` lets applications enforce per-tenant quotas,
+  concurrency permits, and operation timeouts. Tenants are derived from the
+  authenticated principal: anonymous requests use `anonymous`, access-key
+  requests use the access key ID, and custom auth uses the custom principal ID.
+
+Tenant limits are hook-based. The crate calls `begin_operation` after
+authentication and before handler execution; providers may return an S3 error,
+an operation timeout, and/or an owned permit guard. The crate calls
+`finish_operation` once for every begun operation with the final status, S3
+error details when present, timeout flag, and decoded upload bytes when known.
 
 ## Register Processors
 

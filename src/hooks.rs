@@ -1,9 +1,9 @@
 //! Developer tuning hooks for embedded S3 endpoint applications.
 
-use std::{fmt, future::Future, sync::Arc};
+use std::{fmt, future::Future, sync::Arc, time::Duration};
 
 use axum::{
-    http::{HeaderMap, Method, Uri},
+    http::{HeaderMap, Method, StatusCode, Uri},
     response::Response,
 };
 use chrono::{DateTime, Utc};
@@ -35,6 +35,8 @@ pub type SharedUploadPolicy = Arc<dyn UploadPolicy>;
 pub type SharedResponseMapper = Arc<dyn ResponseMapper>;
 /// Shared clock object.
 pub type SharedClock = Arc<dyn Clock>;
+/// Shared tenant limits provider object.
+pub type SharedTenantLimitsProvider = Arc<dyn TenantLimitsProvider>;
 
 /// Authenticated principal visible to tuning hooks.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,6 +53,40 @@ pub enum RequestPrincipal {
         /// Stable principal identifier.
         id: String,
     },
+}
+
+/// Stable tenant identifier used by tenant limit hooks.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct TenantId(String);
+
+impl TenantId {
+    /// Creates a tenant ID from a non-empty value.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Returns the tenant ID as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&RequestPrincipal> for TenantId {
+    fn from(principal: &RequestPrincipal) -> Self {
+        match principal {
+            RequestPrincipal::Anonymous => Self::new("anonymous"),
+            RequestPrincipal::AccessKey { access_key_id } => {
+                Self::new(access_key_id.as_str().to_owned())
+            }
+            RequestPrincipal::Custom { id } => Self::new(id.clone()),
+        }
+    }
+}
+
+impl fmt::Display for TenantId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
 }
 
 /// Request data passed to a custom authentication provider.
@@ -199,6 +235,130 @@ pub struct UploadPolicyContext {
     pub headers: HeaderMap,
 }
 
+/// Per-tenant operation limit context passed before and after request handling.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TenantLimitContext {
+    /// Request ID attached to this request.
+    pub request_id: RequestId,
+    /// Derived tenant ID.
+    pub tenant: TenantId,
+    /// Authenticated principal.
+    pub principal: RequestPrincipal,
+    /// HTTP method.
+    pub method: Method,
+    /// Parsed S3 operation.
+    pub operation: S3Operation,
+    /// IAM-style action for this operation.
+    pub action: S3Action,
+    /// Parsed bucket when target parsing succeeded.
+    pub bucket: Option<BucketName>,
+    /// Parsed object key when target parsing succeeded.
+    pub key: Option<ObjectKey>,
+    /// Multipart upload ID when present in the request query.
+    pub upload_id: Option<UploadId>,
+    /// Multipart part number when present in the request query.
+    pub part_number: Option<PartNumber>,
+    /// Raw request content length when provided.
+    pub content_length: Option<u64>,
+}
+
+/// Outcome passed to tenant limit providers after an operation finishes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TenantOperationOutcome {
+    /// Final HTTP status before response mapping.
+    pub status: StatusCode,
+    /// Whether the operation failed because its timeout elapsed.
+    pub timed_out: bool,
+    /// S3 error code for failed operations.
+    pub error_code: Option<String>,
+    /// S3 error message for failed operations.
+    pub error_message: Option<String>,
+    /// Decoded bytes observed for completed uploads when known.
+    pub decoded_bytes: Option<u64>,
+}
+
+impl TenantOperationOutcome {
+    /// Builds a successful operation outcome from a response.
+    pub fn success(status: StatusCode, decoded_bytes: Option<u64>) -> Self {
+        Self {
+            status,
+            timed_out: false,
+            error_code: None,
+            error_message: None,
+            decoded_bytes,
+        }
+    }
+
+    /// Builds a failed operation outcome from an S3 error.
+    pub fn error(error: &S3Error, decoded_bytes: Option<u64>) -> Self {
+        Self {
+            status: error.status(),
+            timed_out: false,
+            error_code: Some(error.code().to_owned()),
+            error_message: Some(error.message().to_owned()),
+            decoded_bytes,
+        }
+    }
+
+    /// Builds an operation timeout outcome.
+    pub fn timed_out(error: &S3Error) -> Self {
+        Self {
+            status: error.status(),
+            timed_out: true,
+            error_code: Some(error.code().to_owned()),
+            error_message: Some(error.message().to_owned()),
+            decoded_bytes: None,
+        }
+    }
+}
+
+/// Lease returned by tenant limit providers for an admitted operation.
+pub struct TenantOperationLease {
+    timeout: Option<Duration>,
+    _permit: Option<Box<dyn Send + Sync>>,
+}
+
+impl TenantOperationLease {
+    /// Creates a lease with no timeout or external permit.
+    pub fn new() -> Self {
+        Self {
+            timeout: None,
+            _permit: None,
+        }
+    }
+
+    /// Creates a lease with an operation timeout.
+    pub fn with_timeout(timeout: Duration) -> Self {
+        Self::new().timeout(timeout)
+    }
+
+    /// Sets the operation timeout for this lease.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Adds an application-owned permit guard to this lease.
+    pub fn permit<P>(mut self, permit: P) -> Self
+    where
+        P: Send + Sync + 'static,
+    {
+        self._permit = Some(Box::new(permit));
+        self
+    }
+
+    /// Returns the configured timeout.
+    pub fn timeout_duration(&self) -> Option<Duration> {
+        self.timeout
+    }
+}
+
+impl Default for TenantOperationLease {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Read-only observer for parsed S3 requests.
 pub trait RequestObserver: Send + Sync + 'static {
     /// Observes a request. Returning normally must not change request handling.
@@ -261,6 +421,43 @@ pub trait ResponseMapper: Send + Sync + 'static {
         context: S3ResponseContext,
         response: Response,
     ) -> BoxFuture<'a, Response>;
+}
+
+/// Per-tenant operation limits and quota hook.
+pub trait TenantLimitsProvider: Send + Sync + 'static {
+    /// Begins an operation or rejects it with an S3 error.
+    fn begin_operation<'a>(
+        &'a self,
+        context: TenantLimitContext,
+    ) -> BoxFuture<'a, Result<TenantOperationLease, S3Error>>;
+
+    /// Observes the final operation outcome.
+    fn finish_operation<'a>(
+        &'a self,
+        context: TenantLimitContext,
+        outcome: TenantOperationOutcome,
+    ) -> BoxFuture<'a, ()>;
+}
+
+/// No-op tenant limits provider used when no provider is configured.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoopTenantLimitsProvider;
+
+impl TenantLimitsProvider for NoopTenantLimitsProvider {
+    fn begin_operation<'a>(
+        &'a self,
+        _context: TenantLimitContext,
+    ) -> BoxFuture<'a, Result<TenantOperationLease, S3Error>> {
+        Box::pin(async { Ok(TenantOperationLease::new()) })
+    }
+
+    fn finish_operation<'a>(
+        &'a self,
+        _context: TenantLimitContext,
+        _outcome: TenantOperationOutcome,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
 }
 
 impl<F, Fut> ResponseMapper for F
@@ -384,5 +581,33 @@ impl fmt::Display for RequestPrincipal {
             Self::AccessKey { access_key_id } => write!(formatter, "{access_key_id}"),
             Self::Custom { id } => formatter.write_str(id),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AccessKeyId;
+
+    #[test]
+    fn tenant_id_is_derived_from_request_principal() {
+        assert_eq!(
+            TenantId::from(&RequestPrincipal::Anonymous).as_str(),
+            "anonymous"
+        );
+        assert_eq!(
+            TenantId::from(&RequestPrincipal::AccessKey {
+                access_key_id: AccessKeyId::parse("client-a").expect("access key")
+            })
+            .as_str(),
+            "client-a"
+        );
+        assert_eq!(
+            TenantId::from(&RequestPrincipal::Custom {
+                id: "tenant-a".to_owned()
+            })
+            .as_str(),
+            "tenant-a"
+        );
     }
 }

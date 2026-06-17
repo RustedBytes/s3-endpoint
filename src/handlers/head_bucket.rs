@@ -5,13 +5,10 @@ use axum::{
 };
 
 use crate::{
-    AppState,
+    AppState, auth,
     config::S3Action,
     error::S3Error,
-    handlers::request::{
-        authenticate_request, authorize_request, resolve_request_bucket,
-        validate_empty_payload_hash,
-    },
+    handlers::request::{authorize_request, resolve_request_bucket, validate_empty_payload_hash},
     s3::types::RequestId,
 };
 
@@ -19,8 +16,8 @@ pub(crate) async fn head_bucket(
     state: AppState,
     request: Request<Body>,
     request_id: &RequestId,
+    auth_context: auth::AuthContext,
 ) -> Result<Response, S3Error> {
-    let auth_context = authenticate_request(&state, &request).await?;
     let bucket = resolve_request_bucket(&state, &request)?;
     authorize_request(&state, &auth_context, &bucket, None, S3Action::HeadBucket)?;
     validate_empty_payload_hash(&request)?;

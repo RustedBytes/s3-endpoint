@@ -18,10 +18,7 @@ use crate::{
     error::S3Error,
     handlers::put_object::validate_upload_headers,
     handlers::{
-        request::{
-            authenticate_request, authorize_request, resolve_request_target,
-            validate_empty_payload_hash,
-        },
+        request::{authorize_request, resolve_request_target, validate_empty_payload_hash},
         s3::unique_query_param,
         upload_metadata::collect_upload_metadata,
         validate_empty_request_body_headers, validate_supported_request_body_length,
@@ -37,8 +34,8 @@ pub(crate) async fn create_multipart_upload(
     state: AppState,
     request: Request<Body>,
     request_id: &RequestId,
+    auth_context: auth::AuthContext,
 ) -> Result<Response, S3Error> {
-    let auth_context = authenticate_request(&state, &request).await?;
     validate_empty_request_body_headers(request.headers(), "CreateMultipartUpload")?;
     validate_upload_headers(request.headers())?;
     validate_empty_payload_hash(&request)?;
@@ -88,8 +85,8 @@ pub(crate) async fn upload_part(
     request_id: &RequestId,
     upload_id: UploadId,
     part_number: PartNumber,
+    auth_context: auth::AuthContext,
 ) -> Result<Response, S3Error> {
-    let auth_context = authenticate_request(&state, &request).await?;
     validate_supported_request_body_length(request.headers())?;
     validate_upload_headers(request.headers())?;
     let headers = request.headers().clone();
@@ -182,8 +179,8 @@ pub(crate) async fn list_parts(
     request: Request<Body>,
     request_id: &RequestId,
     upload_id: UploadId,
+    auth_context: auth::AuthContext,
 ) -> Result<Response, S3Error> {
-    let auth_context = authenticate_request(&state, &request).await?;
     let query = request.uri().query().unwrap_or_default();
     let page = ListPartsPageRequest::parse(query)?;
     let session = validate_upload_session_target(&state, &request, &auth_context, &upload_id)?;
@@ -278,8 +275,8 @@ pub(crate) async fn abort_multipart_upload(
     request: Request<Body>,
     request_id: &RequestId,
     upload_id: UploadId,
+    auth_context: auth::AuthContext,
 ) -> Result<Response, S3Error> {
-    let auth_context = authenticate_request(&state, &request).await?;
     validate_empty_request_body_headers(request.headers(), "AbortMultipartUpload")?;
     let session = validate_upload_session_target(&state, &request, &auth_context, &upload_id)?;
     authorize_request(
@@ -309,8 +306,8 @@ pub(crate) async fn complete_multipart_upload(
     request: Request<Body>,
     request_id: &RequestId,
     upload_id: UploadId,
+    auth_context: auth::AuthContext,
 ) -> Result<Response, S3Error> {
-    let auth_context = authenticate_request(&state, &request).await?;
     let headers = request.headers().clone();
     let location = completion_location(&request);
     let session = validate_upload_session_target(&state, &request, &auth_context, &upload_id)?;

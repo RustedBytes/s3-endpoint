@@ -39,8 +39,9 @@ use hooks::{
     RequestObserver, ResponseMapper, S3ErrorContext, S3RequestContext, S3ResponseContext,
     SharedAuthenticationProvider, SharedAuthorizationPolicy, SharedClock, SharedErrorMapper,
     SharedOperationPolicy, SharedRequestIdFactory, SharedRequestObserver, SharedResponseMapper,
-    SharedTargetPolicy, SharedUploadPolicy, SystemClock, TargetContext, TargetPolicy, UploadPolicy,
-    UploadPolicyContext,
+    SharedTargetPolicy, SharedTenantLimitsProvider, SharedUploadPolicy, SystemClock, TargetContext,
+    TargetPolicy, TenantLimitContext, TenantLimitsProvider, TenantOperationLease,
+    TenantOperationOutcome, UploadPolicy, UploadPolicyContext,
 };
 use middleware::{
     SharedUploadProcessor, UploadProcessor, UploadProcessorAction, UploadProcessorError,
@@ -82,6 +83,7 @@ pub struct AppState {
     operation_policy: Option<SharedOperationPolicy>,
     target_policy: Option<SharedTargetPolicy>,
     upload_policy: Option<SharedUploadPolicy>,
+    tenant_limits_provider: SharedTenantLimitsProvider,
     disabled_operations: Arc<HashSet<config::S3Action>>,
     admission: Arc<AdmissionControl>,
 }
@@ -106,6 +108,7 @@ impl AppState {
             operation_policy: None,
             target_policy: None,
             upload_policy: None,
+            tenant_limits_provider: Arc::new(hooks::NoopTenantLimitsProvider),
             disabled_operations: HashSet::new(),
             health_path: Some("/health".to_owned()),
             router_layers: Vec::new(),
@@ -140,6 +143,7 @@ impl AppState {
             operation_policy,
             target_policy,
             upload_policy,
+            tenant_limits_provider,
             disabled_operations,
             health_path: _,
             router_layers: _,
@@ -180,6 +184,7 @@ impl AppState {
             operation_policy,
             target_policy,
             upload_policy,
+            tenant_limits_provider,
             disabled_operations: Arc::new(disabled_operations),
             admission: Arc::new(AdmissionControl::new(&upload_limits)),
         })
@@ -260,6 +265,23 @@ impl AppState {
         } else {
             Ok(())
         }
+    }
+
+    pub(crate) async fn begin_tenant_operation(
+        &self,
+        context: TenantLimitContext,
+    ) -> Result<TenantOperationLease, error::S3Error> {
+        self.tenant_limits_provider.begin_operation(context).await
+    }
+
+    pub(crate) async fn finish_tenant_operation(
+        &self,
+        context: TenantLimitContext,
+        outcome: TenantOperationOutcome,
+    ) {
+        self.tenant_limits_provider
+            .finish_operation(context, outcome)
+            .await;
     }
 
     pub(crate) fn authorize_with_policy(
@@ -343,6 +365,7 @@ pub struct AppBuilder {
     operation_policy: Option<SharedOperationPolicy>,
     target_policy: Option<SharedTargetPolicy>,
     upload_policy: Option<SharedUploadPolicy>,
+    tenant_limits_provider: SharedTenantLimitsProvider,
     disabled_operations: HashSet<config::S3Action>,
     health_path: Option<String>,
     router_layers: Vec<RouterTransform>,
@@ -530,6 +553,15 @@ impl AppBuilder {
         P: UploadPolicy,
     {
         self.upload_policy = Some(Arc::new(policy));
+        self
+    }
+
+    /// Registers a per-tenant operation limits provider.
+    pub fn tenant_limits_provider<P>(mut self, provider: P) -> Self
+    where
+        P: TenantLimitsProvider,
+    {
+        self.tenant_limits_provider = Arc::new(provider);
         self
     }
 
@@ -1254,6 +1286,311 @@ mod tests {
             .expect("state");
 
         assert!(state.upload_processors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tenant_limits_provider_can_deny_before_handler_execution() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let app = AppState::builder(
+            config::Config::builder(temp_dir.path())
+                .allow_anonymous(true)
+                .build(),
+        )
+        .tenant_limits_provider(DenyTenantLimitsProvider)
+        .build_router()
+        .await
+        .expect("router");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/test-bucket")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn tenant_limits_timeout_returns_slow_down_and_preserves_request_id() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let finishes = Arc::new(Mutex::new(Vec::new()));
+        let app = AppState::builder(
+            config::Config::builder(temp_dir.path())
+                .allow_anonymous(true)
+                .build(),
+        )
+        .request_id_factory(|| s3::types::RequestId::parse("timeout-request").expect("request id"))
+        .tenant_limits_provider(RecordingTenantLimitsProvider {
+            begins: Arc::new(Mutex::new(Vec::new())),
+            finishes: Arc::clone(&finishes),
+            timeout: Some(std::time::Duration::from_millis(1)),
+            permit_drops: None,
+        })
+        .upload_processor_fn("slow", |_upload| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(middleware::UploadProcessorAction::Keep)
+        })
+        .build_router()
+        .await
+        .expect("router");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/test-bucket/slow.txt")
+                    .header(header::CONTENT_LENGTH, "4")
+                    .body(Body::from("slow"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-amz-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("timeout-request")
+        );
+        let finishes = finishes.lock().expect("finishes lock");
+        assert_eq!(finishes.len(), 1);
+        assert!(finishes[0].1.timed_out);
+        assert_eq!(finishes[0].1.error_code.as_deref(), Some("SlowDown"));
+    }
+
+    #[tokio::test]
+    async fn tenant_limits_provider_permit_is_dropped_after_completion() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let drops = Arc::new(Mutex::new(0_usize));
+        let app = AppState::builder(
+            config::Config::builder(temp_dir.path())
+                .allow_anonymous(true)
+                .build(),
+        )
+        .tenant_limits_provider(RecordingTenantLimitsProvider {
+            begins: Arc::new(Mutex::new(Vec::new())),
+            finishes: Arc::new(Mutex::new(Vec::new())),
+            timeout: None,
+            permit_drops: Some(Arc::clone(&drops)),
+        })
+        .build_router()
+        .await
+        .expect("router");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/test-bucket")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(*drops.lock().expect("drop lock"), 1);
+    }
+
+    #[tokio::test]
+    async fn tenant_limits_finish_receives_operation_outcomes() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let begins = Arc::new(Mutex::new(Vec::new()));
+        let finishes = Arc::new(Mutex::new(Vec::new()));
+        let app = AppState::builder(
+            config::Config::builder(temp_dir.path())
+                .allow_anonymous(true)
+                .build(),
+        )
+        .tenant_limits_provider(RecordingTenantLimitsProvider {
+            begins: Arc::clone(&begins),
+            finishes: Arc::clone(&finishes),
+            timeout: None,
+            permit_drops: None,
+        })
+        .build_router()
+        .await
+        .expect("router");
+
+        let head = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/test-bucket")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("head response");
+        assert_eq!(head.status(), StatusCode::OK);
+
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/test-bucket/missing.txt")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("missing response");
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let put = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/test-bucket/body.txt")
+                    .header(header::CONTENT_LENGTH, "5")
+                    .body(Body::from("hello"))
+                    .expect("request"),
+            )
+            .await
+            .expect("put response");
+        assert_eq!(put.status(), StatusCode::OK);
+
+        let begins = begins.lock().expect("begins lock");
+        assert_eq!(begins.len(), 3);
+        assert!(
+            begins
+                .iter()
+                .all(|context| context.tenant.as_str() == "anonymous")
+        );
+        assert_eq!(begins[0].action, config::S3Action::HeadBucket);
+        assert_eq!(begins[1].action, config::S3Action::GetObject);
+        assert_eq!(begins[2].action, config::S3Action::PutObject);
+
+        let finishes = finishes.lock().expect("finishes lock");
+        assert_eq!(finishes.len(), 3);
+        assert_eq!(finishes[0].1.status, StatusCode::OK);
+        assert_eq!(finishes[1].1.status, StatusCode::NOT_FOUND);
+        assert_eq!(finishes[1].1.error_code.as_deref(), Some("NoSuchKey"));
+        assert_eq!(finishes[2].1.status, StatusCode::OK);
+        assert_eq!(finishes[2].1.decoded_bytes, Some(5));
+    }
+
+    #[tokio::test]
+    async fn tenant_limits_use_custom_auth_principal_and_authenticate_once() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let auth_calls = Arc::new(Mutex::new(0_usize));
+        let begins = Arc::new(Mutex::new(Vec::new()));
+        let auth_calls_clone = Arc::clone(&auth_calls);
+        let app = AppState::builder(config::Config::new(temp_dir.path().to_path_buf()))
+            .authentication_provider(move |_request: hooks::AuthenticationRequest| {
+                let auth_calls = Arc::clone(&auth_calls_clone);
+                async move {
+                    *auth_calls.lock().expect("auth calls lock") += 1;
+                    Ok(hooks::AuthenticationResult::custom("tenant-a"))
+                }
+            })
+            .tenant_limits_provider(RecordingTenantLimitsProvider {
+                begins: Arc::clone(&begins),
+                finishes: Arc::new(Mutex::new(Vec::new())),
+                timeout: None,
+                permit_drops: None,
+            })
+            .build_router()
+            .await
+            .expect("router");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/test-bucket")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(*auth_calls.lock().expect("auth calls lock"), 1);
+        let begins = begins.lock().expect("begins lock");
+        assert_eq!(begins.len(), 1);
+        assert_eq!(begins[0].tenant.as_str(), "tenant-a");
+        assert_eq!(
+            begins[0].principal,
+            hooks::RequestPrincipal::Custom {
+                id: "tenant-a".to_owned()
+            }
+        );
+    }
+
+    struct DenyTenantLimitsProvider;
+
+    impl hooks::TenantLimitsProvider for DenyTenantLimitsProvider {
+        fn begin_operation<'a>(
+            &'a self,
+            _context: hooks::TenantLimitContext,
+        ) -> BoxFuture<'a, Result<hooks::TenantOperationLease, error::S3Error>> {
+            Box::pin(async { Err(error::S3Error::slow_down("tenant quota exceeded")) })
+        }
+
+        fn finish_operation<'a>(
+            &'a self,
+            _context: hooks::TenantLimitContext,
+            _outcome: hooks::TenantOperationOutcome,
+        ) -> BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    struct RecordingTenantLimitsProvider {
+        begins: Arc<Mutex<Vec<hooks::TenantLimitContext>>>,
+        finishes: Arc<Mutex<Vec<(hooks::TenantLimitContext, hooks::TenantOperationOutcome)>>>,
+        timeout: Option<std::time::Duration>,
+        permit_drops: Option<Arc<Mutex<usize>>>,
+    }
+
+    impl hooks::TenantLimitsProvider for RecordingTenantLimitsProvider {
+        fn begin_operation<'a>(
+            &'a self,
+            context: hooks::TenantLimitContext,
+        ) -> BoxFuture<'a, Result<hooks::TenantOperationLease, error::S3Error>> {
+            let timeout = self.timeout;
+            let permit_drops = self.permit_drops.clone();
+            self.begins.lock().expect("begins lock").push(context);
+            Box::pin(async move {
+                let mut lease = hooks::TenantOperationLease::new();
+                if let Some(timeout) = timeout {
+                    lease = lease.timeout(timeout);
+                }
+                if let Some(permit_drops) = permit_drops {
+                    lease = lease.permit(DropCounter(permit_drops));
+                }
+                Ok(lease)
+            })
+        }
+
+        fn finish_operation<'a>(
+            &'a self,
+            context: hooks::TenantLimitContext,
+            outcome: hooks::TenantOperationOutcome,
+        ) -> BoxFuture<'a, ()> {
+            self.finishes
+                .lock()
+                .expect("finishes lock")
+                .push((context, outcome));
+            Box::pin(async {})
+        }
+    }
+
+    struct DropCounter(Arc<Mutex<usize>>);
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            *self.0.lock().expect("drop counter lock") += 1;
+        }
     }
 
     struct NamedProcessor(&'static str);
